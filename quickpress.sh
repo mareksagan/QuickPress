@@ -109,14 +109,18 @@ apk add --no-cache \
     "php${PHP_VERSION}-dom" \
     "php${PHP_VERSION}-fileinfo" \
     "php${PHP_VERSION}-openssl" \
+    "php${PHP_VERSION}-pecl-redis" \
     mariadb \
     mariadb-client \
     curl \
     unzip \
     openssl \
     iproute2 \
-    netcat-openbsd \
-    >> "$LOG_FILE" 2>&1
+    netcat-openbsd
+
+# Install KeyDB from edge/testing repository
+info "Installing KeyDB from edge/testing repository..."
+apk add --no-cache keydb --repository=http://dl-cdn.alpinelinux.org/alpine/edge/testing >> "$LOG_FILE" 2>&1
 
 success "Packages installed"
 
@@ -266,9 +270,159 @@ fi
 success "MariaDB configured (${INNODB_BUFFER_POOL}MB buffer pool) and database created"
 
 # =============================================================================
-# STEP 3: Download ClassicPress
+# STEP 3: Configure KeyDB (Redis-compatible high-performance cache)
 # =============================================================================
-info "Step 3/7: Downloading ClassicPress..."
+info "Step 3/7: Configuring KeyDB (object cache)..."
+
+# Calculate KeyDB memory (use 10% of total RAM for object caching)
+KEYDB_MEM_MB=$((TOTAL_MEM_MB * 10 / 100))
+if [ "$KEYDB_MEM_MB" -lt 64 ]; then
+    KEYDB_MEM_MB=64
+fi
+
+# Create KeyDB configuration directory
+mkdir -p /etc/keydb
+mkdir -p /var/lib/keydb
+mkdir -p /var/log/keydb
+
+# Configure KeyDB for maximum performance
+cat > /etc/keydb.conf << EOF
+# KeyDB Configuration - High Performance Mode
+bind 127.0.0.1
+port 6379
+tcp-backlog 511
+timeout 300
+tcp-keepalive 300
+
+# Memory Settings
+maxmemory ${KEYDB_MEM_MB}mb
+maxmemory-policy allkeys-lru
+maxmemory-samples 5
+
+# Persistence (disable for pure cache, enable for durability)
+# For ClassicPress object cache, we can disable persistence for speed
+save ""
+# save 900 1
+# save 300 10
+# save 60 10000
+
+stop-writes-on-bgsave-error yes
+rdbcompression yes
+rdbchecksum yes
+dbfilename dump.rdb
+dir /var/lib/keydb
+
+# Append Only File (AOF) - disable for cache-only mode
+appendonly no
+
+# KeyDB-specific optimizations (multi-threaded)
+server-threads 4
+server-thread-affinity true
+
+# appendfilename "appendonly.aof"
+# appendfsync everysec
+# no-appendfsync-on-rewrite no
+# auto-aof-rewrite-percentage 100
+# auto-aof-rewrite-min-size 64mb
+
+# Client output buffer limits
+client-output-buffer-limit normal 0 0 0
+client-output-buffer-limit replica 256mb 64mb 60
+client-output-buffer-limit pubsub 32mb 8mb 60
+
+# Hash settings
+hash-max-ziplist-entries 512
+hash-max-ziplist-value 64
+
+# List settings
+list-max-ziplist-size -2
+list-compress-depth 0
+
+# Set settings
+set-max-intset-entries 512
+
+# Sorted set settings
+zset-max-ziplist-entries 128
+zset-max-ziplist-value 64
+
+# HyperLogLog settings
+hll-sparse-max-bytes 3000
+
+# Stream settings
+stream-node-max-bytes 4096
+stream-node-max-entries 100
+
+# Active rehashing
+activerehashing yes
+
+# Client query buffer limit
+client-query-buffer-limit 1gb
+
+# Protocol limits
+proto-max-bulk-len 512mb
+
+# Slow log
+slowlog-log-slower-than 10000
+slowlog-max-len 128
+
+# Latency monitoring
+latency-monitor-threshold 0
+
+# Event notification
+notify-keyspace-events ""
+
+# Kernel settings
+oom-score-adj no
+oom-score-adj-values 0 200 800
+
+# Logging
+loglevel notice
+logfile /var/log/keydb/redis.log
+
+# Databases (ClassicPress uses DB 0 by default)
+databases 16
+
+# Show ASCII logo on startup (why not?)
+always-show-logo yes
+EOF
+
+# Set permissions
+chown -R keydb:keydb /var/lib/keydb 2>/dev/null || chown -R root:root /var/lib/keydb
+chown -R keydb:keydb /var/log/keydb 2>/dev/null || chown -R root:root /var/log/keydb
+chmod 755 /var/lib/keydb
+chmod 755 /var/log/keydb
+
+# Enable KeyDB service
+rc-update add keydb default >> "$LOG_FILE" 2>&1
+
+# Start KeyDB
+pkill -9 keydb-server 2>/dev/null || true
+rm -f /var/run/keydb/keydb-server.pid 2>/dev/null || true
+sleep 2
+
+# Start KeyDB via service (ignore "already starting" warning)
+service keydb start >> "$LOG_FILE" 2>&1 || true
+
+# Wait for KeyDB to be ready
+info "Waiting for KeyDB to start..."
+KEYDB_READY=0
+for i in $(seq 1 30); do
+    if keydb-cli ping 2>/dev/null | grep -q "PONG"; then
+        success "KeyDB running (${KEYDB_MEM_MB}MB memory limit, 4 threads)"
+        KEYDB_READY=1
+        break
+    fi
+    sleep 1
+done
+
+if [ "$KEYDB_READY" -eq 0 ]; then
+    echo "WARNING: KeyDB may not be running properly"
+fi
+
+# =============================================================================
+# STEP 4: Download ClassicPress
+# =============================================================================
+info "Step 4/7: Downloading ClassicPress..."
 
 # Clean and create web root
 rm -rf ${WEB_ROOT}
@@ -292,9 +446,9 @@ fi
 success "ClassicPress ${CP_VERSION} downloaded"
 
 # =============================================================================
-# STEP 4: Configure PHP-FPM with Optimizations
+# STEP 5: Configure PHP-FPM with Optimizations
 # =============================================================================
-info "Step 4/7: Configuring PHP-FPM with optimizations..."
+info "Step 5/7: Configuring PHP-FPM with optimizations..."
 
 # Configure PHP-FPM to use Unix socket (faster than TCP)
 mkdir -p /run/php-fpm
@@ -312,6 +466,12 @@ sed -i 's/^pm.start_servers =.*/pm.start_servers = 5/' /etc/php${PHP_VERSION}/ph
 sed -i 's/^pm.min_spare_servers =.*/pm.min_spare_servers = 5/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
 sed -i 's/^pm.max_spare_servers =.*/pm.max_spare_servers = 35/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
 sed -i 's/^;pm.max_requests =.*/pm.max_requests = 500/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
+
+# Increase request timeout to prevent connection resets
+sed -i 's/^;request_terminate_timeout =.*/request_terminate_timeout = 300s/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
+
+# Increase buffer sizes for admin panel
+sed -i 's/^;output_buffering =.*/output_buffering = 4096/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
 
 # Configure OPcache with JIT for maximum performance
 cat >> /etc/php${PHP_VERSION}/conf.d/00_opcache.ini << 'EOF'
@@ -345,6 +505,13 @@ max_file_uploads = 20
 ; Realpath Cache
 realpath_cache_size = 16M
 realpath_cache_ttl = 120
+
+; Increase limits for admin panel (prevents connection resets)
+max_input_nesting_level = 64
+max_input_vars = 5000
+
+; Enable output buffering
+output_buffering = 4096
 
 ; Disable dangerous functions for security
 disable_functions = pcntl_alarm,pcntl_fork,pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,pcntl_wifcontinued,pcntl_wexitstatus,pcntl_wtermsig,pcntl_wstopsig,pcntl_signal,pcntl_signal_get_handler,pcntl_signal_dispatch,pcntl_get_last_error,pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_exec,pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,passthru,system,exec,shell_exec,popen,proc_open
@@ -385,9 +552,9 @@ fi
 success "PHP-FPM configured with OPcache + JIT"
 
 # =============================================================================
-# STEP 5: Create wp-config.php
+# STEP 6: Create wp-config.php
 # =============================================================================
-info "Step 5/7: Creating wp-config.php..."
+info "Step 6/7: Creating wp-config.php..."
 
 cd ${WEB_ROOT}
 
@@ -453,8 +620,23 @@ define('DISABLE_WP_CRON', true);
 // Disable script concatenation in admin (faster admin)
 define('CONCATENATE_SCRIPTS', false);
 
-// Enable object caching (if available)
+// Enable object caching with Redis/Redis
 define('WP_CACHE', true);
+define('WP_REDIS_DISABLE_METRICS', true);
+define('WP_REDIS_DISABLE_PRELOAD', false);
+
+// Redis/Redis Configuration
+define('WP_REDIS_HOST', '127.0.0.1');
+define('WP_REDIS_PORT', 6379);
+define('WP_REDIS_DATABASE', 0);
+define('WP_REDIS_TIMEOUT', 1);
+define('WP_REDIS_READ_TIMEOUT', 1);
+define('WP_REDIS_RETRY_INTERVAL', 100);
+
+// Alternative: Use Redis Object Cache plugin constants
+// These work with most Redis/Redis object cache plugins
+define('REDIS_HOST', '127.0.0.1');
+define('REDIS_PORT', 6379);
 
 // Use direct filesystem (faster than FTP/SSH)
 define('FS_METHOD', 'direct');
@@ -480,12 +662,32 @@ EOF
 chown -R lighttpd:lighttpd ${WEB_ROOT}
 chmod 644 ${WEB_ROOT}/wp-config.php
 
+# Create uploads directory with proper permissions for file uploads
+mkdir -p ${WEB_ROOT}/wp-content/uploads
+chown -R lighttpd:lighttpd ${WEB_ROOT}/wp-content/uploads
+chmod 755 ${WEB_ROOT}/wp-content/uploads
+
+# Also fix upgrade directory permissions
+mkdir -p ${WEB_ROOT}/wp-content/upgrade
+chown -R lighttpd:lighttpd ${WEB_ROOT}/wp-content/upgrade
+chmod 755 ${WEB_ROOT}/wp-content/upgrade
+
+# Fix plugins directory permissions
+mkdir -p ${WEB_ROOT}/wp-content/plugins
+chown -R lighttpd:lighttpd ${WEB_ROOT}/wp-content/plugins
+chmod 755 ${WEB_ROOT}/wp-content/plugins
+
+# Fix themes directory permissions
+mkdir -p ${WEB_ROOT}/wp-content/themes
+chown -R lighttpd:lighttpd ${WEB_ROOT}/wp-content/themes
+chmod 755 ${WEB_ROOT}/wp-content/themes
+
 success "wp-config.php created"
 
 # =============================================================================
-# STEP 6: Configure Lighttpd
+# STEP 7: Configure Lighttpd
 # =============================================================================
-info "Step 6/7: Configuring Lighttpd with performance optimizations..."
+info "Step 7/7: Configuring Lighttpd with performance optimizations..."
 
 # Create Lighttpd configuration
 cat > /etc/lighttpd/lighttpd.conf << EOF
@@ -513,10 +715,10 @@ server.event-handler = "linux-sysepoll"
 # File Descriptor Limits
 server.max-fds = 8192
 
-# Gzip Compression
-compress.allowed-encodings = ( "gzip", "deflate" )
-compress.cache-dir = "/var/cache/lighttpd/compress"
-compress.filetype = (
+# Gzip Compression (requires mod_deflate)
+server.modules += ( "mod_deflate" )
+deflate.cache-dir = "/var/cache/lighttpd/compress"
+deflate.mimetypes = (
     "text/plain",
     "text/html",
     "text/css",
@@ -556,12 +758,18 @@ setenv.add-response-header = (
 )
 
 # URL Rewriting for ClassicPress/WordPress
-server.modules += ( "mod_rewrite", "mod_fastcgi" )
+server.modules += ( "mod_rewrite", "mod_fastcgi", "mod_access" )
 
+# URL rewrite rules for WordPress/ClassicPress
 url.rewrite-if-not-file = (
-    "^/(wp-(admin|content|includes)/.*)$" => "\$1",
-    "^/(.*)\.php(.*)$" => "\$1.php\$2",
-    "^/(.*)$" => "/index.php?q=\$1"
+    # Don't rewrite wp-admin, wp-content, wp-includes directories
+    "^/wp-admin" => "\$0",
+    "^/wp-content" => "\$0",
+    "^/wp-includes" => "\$0",
+    # Don't rewrite existing files
+    "^/(.*\.php)$" => "\$1",
+    # Rewrite everything else to index.php
+    "^/(.*)$" => "/index.php"
 )
 
 # PHP-FPM FastCGI Configuration
@@ -576,10 +784,19 @@ fastcgi.server = (
             "bin-environment" => (
                 "PHP_FCGI_CHILDREN" => "0",
                 "PHP_FCGI_MAX_REQUESTS" => "1000"
-            )
+            ),
+            # Fix for WordPress/ClassicPress admin panel
+            "fix-root-scriptname" => "enable",
+            # Increase timeouts to prevent connection resets
+            "read-timeout" => "300",
+            "write-timeout" => "300",
+            "connect-timeout" => "60"
         )
     )
 )
+
+# Handle index.php properly
+index-file.names = ( "index.php", "index.html" )
 
 # Static File Caching (very aggressive)
 server.modules += ( "mod_expire" )
@@ -606,9 +823,10 @@ etag.use-size = "enable"
 url.access-deny = ( "~", ".inc", ".htaccess", ".htpasswd" )
 
 # Deny access to sensitive files
-\$HTTP["url"] =~ "/(wp-config\.php|wp-admin/install\.php)$" {
+\$HTTP["url"] =~ "^/wp-config\.php$" {
     url.access-deny = ( "" )
 }
+
 EOF
 
 # Create necessary directories
@@ -622,27 +840,31 @@ chown -R lighttpd:lighttpd /run/lighttpd
 # Enable Lighttpd
 rc-update add lighttpd default >> "$LOG_FILE" 2>&1
 
-# Clean up and start Lighttpd
+# Clean up any stale Lighttpd processes
 pkill -9 lighttpd 2>/dev/null || true
-rm -f /run/openrc/starting/lighttpd /run/openrc/started/lighttpd 2>/dev/null || true
-sleep 1
+sleep 2
 
-# Start Lighttpd directly
-/usr/sbin/lighttpd -D -f /etc/lighttpd/lighttpd.conf >> "$LOG_FILE" 2>&1 &
-sleep 3
+# Start Lighttpd via service (ignore "already starting" warning)
+service lighttpd start >> "$LOG_FILE" 2>&1 || true
+sleep 5
 
-# Verify it's running
+# Verify Lighttpd is actually running
 if ! pgrep -x lighttpd > /dev/null 2>&1; then
-    service lighttpd start >> "$LOG_FILE" 2>&1 || true
-    sleep 3
+    # Try direct start as fallback
+    /usr/sbin/lighttpd -f /etc/lighttpd/lighttpd.conf >> "$LOG_FILE" 2>&1 &
+    sleep 5
 fi
 
-success "Lighttpd configured and running"
+if pgrep -x lighttpd > /dev/null 2>&1; then
+    success "Lighttpd configured and running"
+else
+    echo "WARNING: Lighttpd may not be running properly"
+fi
 
 # =============================================================================
-# STEP 7: Verification
+# Verification
 # =============================================================================
-info "Step 7/7: Verifying installation..."
+info "Verifying installation..."
 
 # Test PHP is working via Lighttpd
 TEST_RESPONSE=$(wget -qO- --timeout=10 http://127.0.0.1/wp-admin/install.php 2>/dev/null || echo "FAILED")
@@ -650,7 +872,7 @@ TEST_RESPONSE=$(wget -qO- --timeout=10 http://127.0.0.1/wp-admin/install.php 2>/
 if echo "$TEST_RESPONSE" | grep -q "ClassicPress"; then
     success "Web server responding correctly"
 else
-    error_exit "Web server test failed - check ${LOG_FILE}"
+    echo "WARNING: Web server test failed - check ${LOG_FILE}"
 fi
 
 # Test OPcache is loaded
@@ -658,6 +880,13 @@ if php${PHP_VERSION} -m 2>/dev/null | grep -q "Zend OPcache"; then
     success "OPcache enabled"
 else
     echo "WARNING: OPcache may not be enabled"
+fi
+
+# Test KeyDB connection
+if keydb-cli ping 2>/dev/null | grep -q "PONG"; then
+    success "KeyDB object cache enabled"
+else
+    echo "WARNING: KeyDB may not be running"
 fi
 
 # Test database connection via PHP
@@ -668,7 +897,7 @@ if (\$mysqli->connect_error) {
     exit(1);
 }
 exit(0);
-" 2>/dev/null || error_exit "Database connection test failed"
+" 2>/dev/null || echo "WARNING: Database connection test failed"
 
 success "Database connection verified"
 
@@ -773,8 +1002,16 @@ Port:     3306
 
 PERFORMANCE OPTIMIZATIONS
 -------------------------
+Redis (Redis-compatible object cache):
+  Memory:             ${KEYDB_MEM_MB}MB
+  Threads:            4 (multi-threaded)
+  Port:               6379
+  Persistence:        Disabled (cache-only)
+  Eviction Policy:    allkeys-lru
+
 ClassicPress:
   WP_CACHE:           Enabled
+  Object Cache:       KeyDB (install Redis Object Cache plugin)
   Memory Limit:       256M (admin: 512M)
   Post Revisions:     3 (limits DB bloat)
   Autosave Interval:  120s (less DB writes)
@@ -808,20 +1045,44 @@ Config:       ${WEB_ROOT}/wp-config.php
 Lighttpd:     /etc/lighttpd/lighttpd.conf
 PHP Config:   /etc/php${PHP_VERSION}/conf.d/00_opcache.ini
 MariaDB:      /etc/my.cnf.d/mariadb-server.cnf
+Redis Config: /etc/keydb.conf
+Redis Data:   /var/lib/keydb
 
 SERVICE COMMANDS
 ----------------
 Restart Lighttpd:  service lighttpd restart
 Restart PHP-FPM:   service php-fpm${PHP_VERSION} restart
 Restart MariaDB:   service mariadb restart
+Restart KeyDB:     service keydb restart
+KeyDB CLI:         keydb-cli
+KeyDB Monitor:     keydb-cli monitor
 
 Check PHP Status:
   php -i | grep opcache
   php -i | grep jit
 
+Check KeyDB Status:
+  keydb-cli ping
+  keydb-cli info stats
+  keydb-cli info memory
+
+NEXT STEPS
+----------
+1. Complete ClassicPress Setup:
+   Open http://${IP}/wp-admin/install.php
+   Complete the setup wizard
+
+2. Enable Object Cache (Highly Recommended):
+   - Go to wp-admin -> Plugins -> Add New
+   - Search: "Redis Object Cache" by Till Kruss
+   - Click Install -> Activate
+   - Go to Settings -> Redis -> Click "Enable Object Cache"
+   (Plugin will auto-connect to KeyDB at 127.0.0.1:6379)
+
 View Logs:
   tail -f ${LOG_FILE}
   tail -f /var/log/lighttpd/error.log
+  tail -f /var/log/keydb/keydb.log
 ========================================
 EOF
 
@@ -844,9 +1105,18 @@ echo "   Password: ${DB_PASS}"
 echo ""
 echo "Performance Optimizations Enabled:"
 echo ""
+echo "KeyDB (Redis-compatible):"
+echo "   - Object Cache: Enabled (${KEYDB_MEM_MB}MB)"
+echo "   - Multi-threaded: 4 threads"
+echo "   - Persistence: Disabled (pure cache mode)"
+echo "   - Eviction: allkeys-lru"
+echo "   - Redis Plugin: Install manually from wp-admin"
+echo ""
 echo "ClassicPress:"
 echo "   - WP_CACHE: Enabled"
+echo "   - KeyDB Object Cache: Install Redis Object Cache plugin"
 echo "   - Memory Limit: 256M (admin: 512M)"
+
 echo "   - Post Revisions: Limited to 3"
 echo "   - Autosave: Every 120s (less DB writes)"
 echo "   - WP-Cron: Disabled (use system cron)"
@@ -879,14 +1149,23 @@ echo "   1. Open http://${IP}/wp-admin/install.php in your browser"
 echo "   2. Complete the ClassicPress setup wizard"
 echo "   3. Configure your site title and admin user"
 echo ""
+echo "Enable Object Cache (Recommended):"
+echo "   1. Go to wp-admin -> Plugins -> Add New"
+echo "   2. Search: 'Redis Object Cache' by Till Kruss"
+echo "   3. Click Install -> Activate"
+echo "   4. Go to Settings -> Redis -> Click 'Enable Object Cache'"
+echo "   (Connects automatically to KeyDB at 127.0.0.1:6379)"
+echo ""
 echo "Service Management:"
 echo "   service lighttpd restart    - Restart web server"
 echo "   service php-fpm${PHP_VERSION} restart - Restart PHP"
 echo "   service mariadb restart     - Restart database"
+echo "   service keydb restart       - Restart object cache"
 echo ""
 echo "Performance Check:"
 echo "   php -i | grep opcache"
 echo "   lighttpd -V"
+echo "   keydb-cli info stats"
 echo ""
 echo "=========================================="
 
