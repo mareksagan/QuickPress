@@ -4,6 +4,16 @@ set -e
 # =============================================================================
 # ClassicPress Alpine Linux Installer - VM Edition
 # End-to-end automated installer for Alpine Linux VMs using OpenRC
+#
+# Environment Variables:
+#   DOMAIN  - Domain name for Let's Encrypt SSL (optional)
+#   EMAIL   - Email address for Let's Encrypt SSL (optional)
+#   IP_SSL  - Set to 'yes' for self-signed certificate (works with IP addresses)
+#
+# SSL Examples:
+#   Let's Encrypt (requires domain):  DOMAIN=example.com EMAIL=admin@example.com ./quickpress.sh
+#   Self-signed (works with IP):      IP_SSL=yes ./quickpress.sh
+#   No SSL (HTTP only):               ./quickpress.sh
 # =============================================================================
 
 # Configuration
@@ -14,6 +24,14 @@ WEB_ROOT="/var/www/classicpress"
 PHP_VERSION="83"
 CREDENTIALS_FILE="/root/classicpress-login.txt"
 LOG_FILE="/var/log/classicpress-install.log"
+
+# SSL Configuration (optional - leave empty to skip SSL setup)
+# For Let's Encrypt: Set both DOMAIN and EMAIL (e.g., DOMAIN=example.com EMAIL=admin@example.com)
+# For self-signed IP cert: Set IP_SSL=yes (works with IP addresses, browsers will show warning)
+DOMAIN="${DOMAIN:-}"
+EMAIL="${EMAIL:-}"
+IP_SSL="${IP_SSL:-}"
+SSL_DIR="/etc/ssl/acme"
 
 # =============================================================================
 # Helper Functions
@@ -84,7 +102,7 @@ success "Alpine Linux detected: $(cat /etc/alpine-release)"
 # =============================================================================
 # STEP 1: Install Packages
 # =============================================================================
-info "Step 1/6: Installing packages..."
+info "Step 1/8: Installing packages..."
 
 # Update package index
 apk update >> "$LOG_FILE" 2>&1
@@ -110,13 +128,21 @@ apk add --no-cache \
     "php${PHP_VERSION}-fileinfo" \
     "php${PHP_VERSION}-openssl" \
     "php${PHP_VERSION}-pecl-redis" \
+    "php${PHP_VERSION}-exif" \
+    "php${PHP_VERSION}-iconv" \
+    "php${PHP_VERSION}-pecl-imagick" \
+    "php${PHP_VERSION}-intl" \
+    openssl \
+    socat \
     mariadb \
     mariadb-client \
     curl \
     unzip \
     openssl \
     iproute2 \
-    netcat-openbsd
+    netcat-openbsd \
+    imagemagick \
+    libgomp
 
 # Install KeyDB from edge/testing repository
 info "Installing KeyDB from edge/testing repository..."
@@ -132,7 +158,7 @@ fi
 # =============================================================================
 # STEP 2: Configure and Start MariaDB with Performance Optimizations
 # =============================================================================
-info "Step 2/6: Configuring MariaDB with performance optimizations..."
+info "Step 2/8: Configuring MariaDB with performance optimizations..."
 
 # Create MariaDB directories
 mkdir -p /run/mysqld
@@ -272,7 +298,7 @@ success "MariaDB configured (${INNODB_BUFFER_POOL}MB buffer pool) and database c
 # =============================================================================
 # STEP 3: Configure KeyDB (Redis-compatible high-performance cache)
 # =============================================================================
-info "Step 3/7: Configuring KeyDB (object cache)..."
+info "Step 3/8: Configuring KeyDB (object cache)..."
 
 # Calculate KeyDB memory (use 10% of total RAM for object caching)
 KEYDB_MEM_MB=$((TOTAL_MEM_MB * 10 / 100))
@@ -422,7 +448,7 @@ fi
 # =============================================================================
 # STEP 4: Download ClassicPress
 # =============================================================================
-info "Step 4/7: Downloading ClassicPress..."
+info "Step 4/8: Downloading ClassicPress..."
 
 # Clean and create web root
 rm -rf ${WEB_ROOT}
@@ -448,7 +474,7 @@ success "ClassicPress ${CP_VERSION} downloaded"
 # =============================================================================
 # STEP 5: Configure PHP-FPM with Optimizations
 # =============================================================================
-info "Step 5/7: Configuring PHP-FPM with optimizations..."
+info "Step 5/8: Configuring PHP-FPM with optimizations..."
 
 # Configure PHP-FPM to use Unix socket (faster than TCP)
 mkdir -p /run/php-fpm
@@ -513,6 +539,15 @@ max_input_vars = 5000
 ; Enable output buffering
 output_buffering = 4096
 
+; Enable file uploads
+file_uploads = On
+
+; Temporary upload directory
+upload_tmp_dir = /tmp
+
+; Maximum upload file size (must be <= post_max_size)
+upload_max_filesize = 64M
+
 ; Disable dangerous functions for security
 disable_functions = pcntl_alarm,pcntl_fork,pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,pcntl_wifcontinued,pcntl_wexitstatus,pcntl_wtermsig,pcntl_wstopsig,pcntl_signal,pcntl_signal_get_handler,pcntl_signal_dispatch,pcntl_get_last_error,pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_exec,pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,passthru,system,exec,shell_exec,popen,proc_open
 EOF
@@ -554,7 +589,7 @@ success "PHP-FPM configured with OPcache + JIT"
 # =============================================================================
 # STEP 6: Create wp-config.php
 # =============================================================================
-info "Step 6/7: Creating wp-config.php..."
+info "Step 6/8: Creating wp-config.php..."
 
 cd ${WEB_ROOT}
 
@@ -644,10 +679,11 @@ define('FS_METHOD', 'direct');
 // Disable automatic updates (for stability)
 define('AUTOMATIC_UPDATER_DISABLED', false);
 
-// Debug mode (disable in production)
-define('WP_DEBUG', false);
-define('WP_DEBUG_LOG', false);
+// Debug mode (enabled for troubleshooting)
+define('WP_DEBUG', true);
+define('WP_DEBUG_LOG', true);
 define('WP_DEBUG_DISPLAY', false);
+// Debug log location: ${WEB_ROOT}/wp-content/debug.log
 
 // Absolute path to the WordPress directory
 if (!defined('ABSPATH')) {
@@ -658,19 +694,30 @@ if (!defined('ABSPATH')) {
 require_once ABSPATH . 'wp-settings.php';
 EOF
 
-# Set ownership and permissions
+# Set ownership and permissions - CRITICAL FOR UPLOADS
+info "Setting file permissions for uploads..."
+
+# Set ownership on web root (recursive)
 chown -R lighttpd:lighttpd ${WEB_ROOT}
 chmod 644 ${WEB_ROOT}/wp-config.php
 
+# Fix wp-content directory permissions - parent MUST be writable
+mkdir -p ${WEB_ROOT}/wp-content
+chown lighttpd:lighttpd ${WEB_ROOT}/wp-content
+chmod 775 ${WEB_ROOT}/wp-content  # 775 allows group write for uploads
+
 # Create uploads directory with proper permissions for file uploads
 mkdir -p ${WEB_ROOT}/wp-content/uploads
-chown -R lighttpd:lighttpd ${WEB_ROOT}/wp-content/uploads
-chmod 755 ${WEB_ROOT}/wp-content/uploads
+chown lighttpd:lighttpd ${WEB_ROOT}/wp-content/uploads
+chmod 775 ${WEB_ROOT}/wp-content/uploads  # 775 with setgid for inheritance
+
+# Set setgid bit on uploads directory so new files inherit group
+chmod g+s ${WEB_ROOT}/wp-content/uploads
 
 # Also fix upgrade directory permissions
 mkdir -p ${WEB_ROOT}/wp-content/upgrade
-chown -R lighttpd:lighttpd ${WEB_ROOT}/wp-content/upgrade
-chmod 755 ${WEB_ROOT}/wp-content/upgrade
+chown lighttpd:lighttpd ${WEB_ROOT}/wp-content/upgrade
+chmod 775 ${WEB_ROOT}/wp-content/upgrade
 
 # Fix plugins directory permissions
 mkdir -p ${WEB_ROOT}/wp-content/plugins
@@ -682,12 +729,89 @@ mkdir -p ${WEB_ROOT}/wp-content/themes
 chown -R lighttpd:lighttpd ${WEB_ROOT}/wp-content/themes
 chmod 755 ${WEB_ROOT}/wp-content/themes
 
+# Create test upload directory structure to verify permissions work
+TEST_YEAR=$(date +%Y)
+TEST_MONTH=$(date +%m)
+mkdir -p "${WEB_ROOT}/wp-content/uploads/${TEST_YEAR}/${TEST_MONTH}"
+chown -R lighttpd:lighttpd "${WEB_ROOT}/wp-content/uploads"
+chmod -R 775 "${WEB_ROOT}/wp-content/uploads"
+
+# Create debug.log file with proper permissions
+touch "${WEB_ROOT}/wp-content/debug.log"
+chown lighttpd:lighttpd "${WEB_ROOT}/wp-content/debug.log"
+chmod 664 "${WEB_ROOT}/wp-content/debug.log"
+
+# Verify permissions
+if [ -w "${WEB_ROOT}/wp-content/uploads" ]; then
+    success "Upload directory permissions set correctly"
+else
+    echo "WARNING: Upload directory may not be writable"
+fi
+
+# Fix /tmp permissions for PHP uploads (critical for VM environments)
+chmod 1777 /tmp
+chown root:root /tmp
+
+# Create a permission fix script for future use
+cat > /usr/local/bin/fix-classicpress-permissions << 'PERMEOF'
+#!/bin/sh
+# Fix ClassicPress/WordPress permissions
+# Run this if uploads fail or permissions get corrupted
+
+WEB_ROOT="/var/www/classicpress"
+PHP_USER="lighttpd"
+
+echo "Fixing ClassicPress permissions..."
+
+# Fix ownership
+chown -R ${PHP_USER}:${PHP_USER} ${WEB_ROOT}
+
+# Fix wp-config.php
+chmod 644 ${WEB_ROOT}/wp-config.php
+
+# Fix directories
+find ${WEB_ROOT} -type d -exec chmod 755 {} \;
+
+# Fix wp-content and uploads (need write permission)
+chmod 775 ${WEB_ROOT}/wp-content
+chmod 775 ${WEB_ROOT}/wp-content/uploads
+chmod 775 ${WEB_ROOT}/wp-content/upgrade
+chmod g+s ${WEB_ROOT}/wp-content/uploads
+
+# Fix PHP files
+find ${WEB_ROOT} -type f -name "*.php" -exec chmod 644 {} \;
+
+# Fix uploaded files (images, etc.)
+find ${WEB_ROOT}/wp-content/uploads -type f -exec chmod 664 {} \; 2>/dev/null || true
+
+# Fix /tmp
+chmod 1777 /tmp
+
+echo "Permissions fixed. Testing upload directory..."
+if sudo -u ${PHP_USER} touch ${WEB_ROOT}/wp-content/uploads/.test 2>/dev/null; then
+    rm -f ${WEB_ROOT}/wp-content/uploads/.test
+    echo "SUCCESS: Upload directory is writable"
+else
+    echo "ERROR: Upload directory is still not writable"
+    echo "Check: ls -la ${WEB_ROOT}/wp-content/"
+fi
+PERMEOF
+chmod +x /usr/local/bin/fix-classicpress-permissions
+
+# Create PHP temp directory if specified differently
+PHP_TEMP_DIR=$(php${PHP_VERSION} -r 'echo sys_get_temp_dir();' 2>/dev/null) || PHP_TEMP_DIR="/tmp"
+if [ "$PHP_TEMP_DIR" != "/tmp" ]; then
+    mkdir -p "$PHP_TEMP_DIR"
+    chmod 1777 "$PHP_TEMP_DIR"
+    chown root:root "$PHP_TEMP_DIR"
+fi
+
 success "wp-config.php created"
 
 # =============================================================================
 # STEP 7: Configure Lighttpd
 # =============================================================================
-info "Step 7/7: Configuring Lighttpd with performance optimizations..."
+info "Step 7/8: Configuring Lighttpd with performance optimizations..."
 
 # Create Lighttpd configuration
 cat > /etc/lighttpd/lighttpd.conf << EOF
@@ -862,6 +986,264 @@ else
 fi
 
 # =============================================================================
+# STEP 8: Let's Encrypt SSL Setup (Optional)
+# =============================================================================
+info "Step 8/8: Checking for Let's Encrypt SSL setup..."
+
+SSL_ENABLED=0
+
+if [ -n "$DOMAIN" ] && [ -n "$EMAIL" ]; then
+    info "Setting up Let's Encrypt SSL for domain: $DOMAIN"
+    
+    # Install acme.sh
+    ACME_SH_HOME="/root/.acme.sh"
+    if [ ! -f "$ACME_SH_HOME/acme.sh" ]; then
+        info "Installing acme.sh (Let's Encrypt client)..."
+        curl -s https://get.acme.sh | sh -s email="$EMAIL" >> "$LOG_FILE" 2>&1
+        if [ ! -f "$ACME_SH_HOME/acme.sh" ]; then
+            echo "WARNING: Failed to install acme.sh, SSL setup skipped"
+        fi
+    fi
+    
+    if [ -f "$ACME_SH_HOME/acme.sh" ]; then
+        # Create SSL directory
+        mkdir -p "$SSL_DIR"
+        
+        # Create challenge directory for ACME HTTP-01 validation
+        mkdir -p "${WEB_ROOT}/.well-known/acme-challenge"
+        chown -R lighttpd:lighttpd "${WEB_ROOT}/.well-known"
+        
+        # Issue certificate
+        info "Requesting SSL certificate from Let's Encrypt..."
+        export LE_WORKING_DIR="$ACME_SH_HOME"
+        "$ACME_SH_HOME/acme.sh" --issue \
+            -d "$DOMAIN" \
+            --webroot "$WEB_ROOT" \
+            --keylength 2048 \
+            --reloadcmd "service lighttpd restart" \
+            >> "$LOG_FILE" 2>&1
+        
+        if [ $? -eq 0 ]; then
+            success "SSL certificate obtained for $DOMAIN"
+            
+            # Install certificate files to standard location
+            "$ACME_SH_HOME/acme.sh" --install-cert -d "$DOMAIN" \
+                --key-file "${SSL_DIR}/${DOMAIN}.key" \
+                --fullchain-file "${SSL_DIR}/${DOMAIN}.pem" \
+                --reloadcmd "service lighttpd restart" \
+                >> "$LOG_FILE" 2>&1
+            
+            # Create combined PEM file for Lighttpd
+            cat "${SSL_DIR}/${DOMAIN}.pem" "${SSL_DIR}/${DOMAIN}.key" > "${SSL_DIR}/${DOMAIN}-combined.pem"
+            chmod 600 "${SSL_DIR}/${DOMAIN}"*.pem
+            
+            # Configure Lighttpd for SSL
+            info "Configuring Lighttpd for HTTPS..."
+            
+            # Backup original config
+            cp /etc/lighttpd/lighttpd.conf /etc/lighttpd/lighttpd.conf.http
+            
+            # Create SSL configuration
+            cat >> /etc/lighttpd/lighttpd.conf << EOF
+
+# SSL Configuration for $DOMAIN
+\$SERVER["socket"] == ":443" {
+    ssl.engine = "enable"
+    ssl.pemfile = "${SSL_DIR}/${DOMAIN}-combined.pem"
+    ssl.ca-file = "${SSL_DIR}/${DOMAIN}.pem"
+}
+
+# HTTP to HTTPS redirect
+\$HTTP["scheme"] == "http" {
+    \$HTTP["host"] =~ "^(www\\.)?${DOMAIN}\$" {
+        url.redirect = ("^/(.*)" => "https://${DOMAIN}/\$1")
+    }
+}
+EOF
+            
+            # Restart Lighttpd to apply SSL config
+            service lighttpd restart >> "$LOG_FILE" 2>&1
+            sleep 2
+            
+            # Verify SSL is working
+            if pgrep -x lighttpd > /dev/null 2>&1; then
+                success "SSL configured successfully"
+                SSL_ENABLED=1
+                SSL_TYPE="letsencrypt"
+            else
+                echo "WARNING: Lighttpd failed to start with SSL, restoring HTTP config"
+                cp /etc/lighttpd/lighttpd.conf.http /etc/lighttpd/lighttpd.conf
+                service lighttpd start >> "$LOG_FILE" 2>&1
+                SSL_ENABLED=0
+            fi
+            
+            # Setup auto-renewal cron job (runs twice daily as recommended by Let's Encrypt)
+            info "Setting up automated SSL certificate renewal..."
+            echo "0 3,15 * * * $ACME_SH_HOME/acme.sh --cron --home \"$ACME_SH_HOME\" >> /var/log/acme-renewal.log 2>&1" | crontab -
+            success "SSL auto-renewal configured (runs at 3:00 AM and 3:00 PM daily)"
+            
+        else
+            echo "WARNING: Failed to obtain SSL certificate"
+            echo "  Check the domain DNS and ensure it points to this server"
+            echo "  Logs: $LOG_FILE"
+            SSL_ENABLED=0
+        fi
+    fi
+elif [ "$IP_SSL" = "yes" ] || [ "$IP_SSL" = "1" ] || [ "$IP_SSL" = "true" ]; then
+    # Self-signed certificate for IP address
+    info "Setting up self-signed SSL certificate for IP address..."
+    info "Note: Browsers will show a security warning (this is normal for self-signed certs)"
+    
+    mkdir -p "$SSL_DIR"
+    
+    # Get IP address
+    SERVER_IP=$(ip addr show 2>/dev/null | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | cut -d/ -f1)
+    if [ -z "$SERVER_IP" ]; then
+        SERVER_IP=$(hostname -i 2>/dev/null | awk '{print $1}')
+    fi
+    if [ -z "$SERVER_IP" ]; then
+        SERVER_IP="127.0.0.1"
+    fi
+    
+    CERT_NAME="self-signed-${SERVER_IP}"
+    
+    # Generate self-signed certificate
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout "${SSL_DIR}/${CERT_NAME}.key" \
+        -out "${SSL_DIR}/${CERT_NAME}.pem" \
+        -subj "/CN=${SERVER_IP}" \
+        -addext "subjectAltName=IP:${SERVER_IP}" \
+        >> "$LOG_FILE" 2>&1
+    
+    # Create combined PEM file for Lighttpd
+    cat "${SSL_DIR}/${CERT_NAME}.pem" "${SSL_DIR}/${CERT_NAME}.key" > "${SSL_DIR}/${CERT_NAME}-combined.pem"
+    chmod 600 "${SSL_DIR}/${CERT_NAME}"*.pem
+    
+    # Backup original config
+    cp /etc/lighttpd/lighttpd.conf /etc/lighttpd/lighttpd.conf.http
+    
+    # Create SSL configuration
+    cat >> /etc/lighttpd/lighttpd.conf << EOF
+
+# SSL Configuration (Self-Signed for IP: $SERVER_IP)
+\$SERVER["socket"] == ":443" {
+    ssl.engine = "enable"
+    ssl.pemfile = "${SSL_DIR}/${CERT_NAME}-combined.pem"
+}
+
+# HTTP to HTTPS redirect (for any host)
+\$HTTP["scheme"] == "http" {
+    url.redirect = ("^/(.*)" => "https://${SERVER_IP}/\$1")
+}
+EOF
+    
+    # Restart Lighttpd to apply SSL config
+    service lighttpd restart >> "$LOG_FILE" 2>&1
+    sleep 2
+    
+    if pgrep -x lighttpd > /dev/null 2>&1; then
+        success "Self-signed SSL configured for IP: $SERVER_IP"
+        SSL_ENABLED=1
+        SSL_TYPE="selfsigned"
+        DOMAIN="$SERVER_IP"  # Use IP as domain name for output
+    else
+        echo "WARNING: Lighttpd failed to start with SSL, restoring HTTP config"
+        cp /etc/lighttpd/lighttpd.conf.http /etc/lighttpd/lighttpd.conf
+        service lighttpd start >> "$LOG_FILE" 2>&1
+        SSL_ENABLED=0
+    fi
+    
+    info "Self-signed certificate valid for 365 days"
+    info "Auto-renewal configured (checks daily, renews 30 days before expiry)"
+    
+    # Create renewal script for self-signed certificate
+    RENEW_SCRIPT="/usr/local/bin/renew-selfsigned-cert.sh"
+    cat > "$RENEW_SCRIPT" << 'RENEWEOF'
+#!/bin/sh
+# Self-signed certificate renewal script
+
+SSL_DIR="/etc/ssl/acme"
+LOG_FILE="/var/log/selfsigned-renewal.log"
+
+# Get server IP
+SERVER_IP=$(ip addr show 2>/dev/null | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | cut -d/ -f1)
+if [ -z "$SERVER_IP" ]; then
+    SERVER_IP=$(hostname -i 2>/dev/null | awk '{print $1}')
+fi
+if [ -z "$SERVER_IP" ]; then
+    echo "$(date) - ERROR: Could not determine server IP" >> "$LOG_FILE"
+    exit 1
+fi
+
+CERT_NAME="self-signed-${SERVER_IP}"
+CERT_FILE="${SSL_DIR}/${CERT_NAME}.pem"
+
+# Check if certificate exists
+if [ ! -f "$CERT_FILE" ]; then
+    echo "$(date) - WARNING: Certificate file not found: $CERT_FILE" >> "$LOG_FILE"
+    exit 1
+fi
+
+# Check if certificate expires within 30 days (2592000 seconds)
+EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_FILE" | cut -d= -f2)
+EXPIRY_EPOCH=$(date -d "$EXPIRY" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$EXPIRY" +%s)
+CURRENT_EPOCH=$(date +%s)
+DAYS_UNTIL_EXPIRY=$(( (EXPIRY_EPOCH - CURRENT_EPOCH) / 86400 ))
+
+echo "$(date) - Certificate expires in $DAYS_UNTIL_EXPIRY days" >> "$LOG_FILE"
+
+if [ "$DAYS_UNTIL_EXPIRY" -le 30 ]; then
+    echo "$(date) - Renewing certificate (expires in $DAYS_UNTIL_EXPIRY days)..." >> "$LOG_FILE"
+    
+    # Backup old certificate
+    BACKUP_DIR="${SSL_DIR}/backup-$(date +%Y%m%d)"
+    mkdir -p "$BACKUP_DIR"
+    cp "${SSL_DIR}/${CERT_NAME}"*.pem "$BACKUP_DIR/" 2>/dev/null
+    
+    # Generate new certificate
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout "${SSL_DIR}/${CERT_NAME}.key" \
+        -out "${SSL_DIR}/${CERT_NAME}.pem" \
+        -subj "/CN=${SERVER_IP}" \
+        -addext "subjectAltName=IP:${SERVER_IP}" \
+        >> "$LOG_FILE" 2>&1
+    
+    if [ $? -eq 0 ]; then
+        # Create combined PEM file
+        cat "${SSL_DIR}/${CERT_NAME}.pem" "${SSL_DIR}/${CERT_NAME}.key" > "${SSL_DIR}/${CERT_NAME}-combined.pem"
+        chmod 600 "${SSL_DIR}/${CERT_NAME}"*.pem
+        
+        # Reload Lighttpd
+        service lighttpd reload >> "$LOG_FILE" 2>&1
+        
+        echo "$(date) - Certificate renewed successfully" >> "$LOG_FILE"
+        
+        # Clean up old backups (keep last 5)
+        ls -1d "${SSL_DIR}/backup-"* 2>/dev/null | sort -r | tail -n +6 | xargs -r rm -rf
+    else
+        echo "$(date) - ERROR: Failed to renew certificate" >> "$LOG_FILE"
+        # Restore old certificate from backup
+        cp "${BACKUP_DIR}/${CERT_NAME}"*.pem "${SSL_DIR}/" 2>/dev/null
+        exit 1
+    fi
+else
+    echo "$(date) - Certificate still valid, no renewal needed" >> "$LOG_FILE"
+fi
+RENEWEOF
+    chmod +x "$RENEW_SCRIPT"
+    
+    # Setup cron job to run daily at 2:30 AM (checks if renewal is needed)
+    info "Setting up automated self-signed certificate renewal..."
+    echo "30 2 * * * $RENEW_SCRIPT >> /var/log/selfsigned-renewal.log 2>&1" | crontab -
+    success "Self-signed auto-renewal configured (checks daily, renews 30 days before expiry)"
+else
+    info "SSL setup skipped (set DOMAIN and EMAIL for Let's Encrypt, or IP_SSL=yes for self-signed)"
+    info "  Let's Encrypt: DOMAIN=example.com EMAIL=admin@example.com ./quickpress.sh"
+    info "  Self-signed:   IP_SSL=yes ./quickpress.sh (works with IP addresses)"
+    info "  No SSL:        ./quickpress.sh (HTTP only)"
+fi
+
+# =============================================================================
 # Verification
 # =============================================================================
 info "Verifying installation..."
@@ -901,10 +1283,19 @@ exit(0);
 
 success "Database connection verified"
 
+# Test upload directory is writable
+if sudo -u lighttpd touch "${WEB_ROOT}/wp-content/uploads/.test" 2>/dev/null; then
+    rm -f "${WEB_ROOT}/wp-content/uploads/.test"
+    success "Upload directory is writable"
+else
+    echo "WARNING: Upload directory is not writable - uploads may fail"
+    echo "  Run: fix-classicpress-permissions"
+fi
+
 # =============================================================================
 # STEP 7: ClassicPress Additional Optimizations
 # =============================================================================
-info "Step 7/7: Applying ClassicPress optimizations..."
+info "Step 8/8: Applying ClassicPress optimizations..."
 
 # Create system cron job to replace WP-CRON (much more efficient)
 echo "* * * * * cd ${WEB_ROOT} && php${PHP_VERSION} -q wp-cron.php >/dev/null 2>&1" | crontab - 2>/dev/null || true
@@ -977,6 +1368,15 @@ if [ -z "$IP" ]; then
     IP="YOUR_SERVER_IP"
 fi
 
+# Set URL variables for credentials file
+if [ "$SSL_ENABLED" = "1" ]; then
+    SSL_URL_PREFIX="https"
+    SSL_URL_HOST="${DOMAIN}"
+else
+    SSL_URL_PREFIX="http"
+    SSL_URL_HOST="${IP}"
+fi
+
 # =============================================================================
 # Save Credentials
 # =============================================================================
@@ -989,7 +1389,7 @@ Log File: ${LOG_FILE}
 
 WEBSITE
 -------
-URL: http://${IP}/wp-admin/install.php
+URL: ${SSL_URL_PREFIX}://${SSL_URL_HOST}/wp-admin/install.php
 Local: http://127.0.0.1/wp-admin/install.php
 
 DATABASE
@@ -1024,6 +1424,11 @@ Max Connections: 2048
 Gzip:           Enabled
 Static Cache:   1 month
 
+SSL Options:
+  Let's Encrypt: DOMAIN=example.com EMAIL=admin@example.com ./quickpress.sh
+  Self-signed:   IP_SSL=yes ./quickpress.sh (works with IP addresses)
+  No SSL:        ./quickpress.sh (HTTP only)
+
 PHP Version:    ${PHP_VERSION}
 OPcache:        Enabled (256MB)
 JIT Compiler:   Enabled (128MB)
@@ -1047,6 +1452,21 @@ PHP Config:   /etc/php${PHP_VERSION}/conf.d/00_opcache.ini
 MariaDB:      /etc/my.cnf.d/mariadb-server.cnf
 Redis Config: /etc/keydb.conf
 Redis Data:   /var/lib/keydb
+SSL Certs:    ${SSL_DIR}
+SSL Setup:    ${SSL_TYPE:-None}
+
+SSL SETUP OPTIONS
+-----------------
+1. Let's Encrypt (trusted certificate, requires domain):
+   DOMAIN=example.com EMAIL=admin@example.com ./quickpress.sh
+   Auto-renewal: 3:00 AM & 3:00 PM daily
+
+2. Self-signed (works with IP addresses, browser warning):
+   IP_SSL=yes ./quickpress.sh
+   Auto-renewal: Daily at 2:30 AM (renews 30 days before expiry)
+
+3. No SSL (HTTP only):
+   ./quickpress.sh
 
 SERVICE COMMANDS
 ----------------
@@ -1083,6 +1503,8 @@ View Logs:
   tail -f ${LOG_FILE}
   tail -f /var/log/lighttpd/error.log
   tail -f /var/log/keydb/keydb.log
+  tail -f /var/log/acme-renewal.log        # Let's Encrypt renewal logs
+  tail -f /var/log/selfsigned-renewal.log  # Self-signed renewal logs
 ========================================
 EOF
 
@@ -1096,13 +1518,39 @@ echo "=========================================="
 echo "INSTALLATION COMPLETE!"
 echo "=========================================="
 echo ""
-echo "Setup URL: http://${IP}/wp-admin/install.php"
+if [ "$SSL_ENABLED" = "1" ]; then
+    echo "Setup URL: https://${DOMAIN}/wp-admin/install.php"
+    echo "HTTP URL:  http://${IP}/wp-admin/install.php (redirects to HTTPS)"
+else
+    echo "Setup URL: http://${IP}/wp-admin/install.php"
+fi
 echo ""
 echo "Database Info:"
 echo "   Name:     ${DB_NAME}"
 echo "   User:     ${DB_USER}"
 echo "   Password: ${DB_PASS}"
 echo ""
+if [ "$SSL_ENABLED" = "1" ]; then
+    if [ "${SSL_TYPE}" = "selfsigned" ]; then
+        echo "SSL/TLS Enabled (Self-Signed):"
+        echo "   - IP Address:   ${DOMAIN}"
+        echo "   - Certificate:  Self-signed (browsers will show warning)"
+        echo "   - Valid for:    365 days"
+        echo "   - Auto-renewal: Checks daily, renews 30 days before expiry"
+        echo ""
+        echo "WARNING: Browsers will show 'Not Secure' warning. This is normal for self-signed certs."
+        echo "         Click 'Advanced' -> 'Proceed anyway' to access the site."
+        echo ""
+    else
+        echo "SSL/TLS Enabled (Let's Encrypt):"
+        echo "   - Domain:       ${DOMAIN}"
+        echo "   - Certificate:  Trusted (browsers show secure lock)"
+        echo "   - Auto-renewal: 3:00 AM & 3:00 PM daily"
+        echo "   - Cert path:    ${SSL_DIR}/${DOMAIN}.pem"
+        echo "   - Key path:     ${SSL_DIR}/${DOMAIN}.key"
+        echo ""
+    fi
+fi
 echo "Performance Optimizations Enabled:"
 echo ""
 echo "KeyDB (Redis-compatible):"
@@ -1145,7 +1593,11 @@ echo ""
 echo "Credentials saved to: ${CREDENTIALS_FILE}"
 echo ""
 echo "Next Steps:"
-echo "   1. Open http://${IP}/wp-admin/install.php in your browser"
+if [ "$SSL_ENABLED" = "1" ]; then
+    echo "   1. Open https://${DOMAIN}/wp-admin/install.php in your browser"
+else
+    echo "   1. Open http://${IP}/wp-admin/install.php in your browser"
+fi
 echo "   2. Complete the ClassicPress setup wizard"
 echo "   3. Configure your site title and admin user"
 echo ""
@@ -1156,11 +1608,42 @@ echo "   3. Click Install -> Activate"
 echo "   4. Go to Settings -> Redis -> Click 'Enable Object Cache'"
 echo "   (Connects automatically to KeyDB at 127.0.0.1:6379)"
 echo ""
+echo "File Upload Troubleshooting:"
+echo "   If uploads fail with 'could not be moved' error:"
+echo "   1. Fix permissions: /usr/local/bin/fix-classicpress-permissions"
+echo "   2. Check /tmp: ls -ld /tmp (should be drwxrwxrwt)"
+echo "   3. Check uploads dir: ls -la ${WEB_ROOT}/wp-content/uploads/"
+echo "   4. PHP extensions: php83 -m | grep -E '(gd|exif|imagick)'"
+echo "   5. Upload limits: php83 -r 'echo ini_get(\"upload_max_filesize\");'"
+echo "   6. Web server errors: tail -f /var/log/lighttpd/error.log"
+echo "   7. PHP error log: tail -f /var/log/php*/error.log"
+echo ""
+echo "Debugging (WP_DEBUG is enabled):"
+echo "   WordPress debug log: tail -f ${WEB_ROOT}/wp-content/debug.log"
+echo "   To disable: Edit ${WEB_ROOT}/wp-config.php and set WP_DEBUG to false"
+echo ""
 echo "Service Management:"
 echo "   service lighttpd restart    - Restart web server"
 echo "   service php-fpm${PHP_VERSION} restart - Restart PHP"
 echo "   service mariadb restart     - Restart database"
 echo "   service keydb restart       - Restart object cache"
+echo "   fix-classicpress-permissions - Fix upload/permission issues"
+if [ "$SSL_ENABLED" = "1" ]; then
+    echo ""
+    if [ "${SSL_TYPE}" = "selfsigned" ]; then
+        echo "SSL Certificate Management (Self-Signed):"
+        echo "   cat ${SSL_DIR}/self-signed-*.pem               - View certificate"
+        echo "   /usr/local/bin/renew-selfsigned-cert.sh        - Manual renewal check"
+        echo "   cat /var/log/selfsigned-renewal.log            - View renewal logs"
+        echo "   rm ${SSL_DIR}/self-signed-* && IP_SSL=yes ./quickpress.sh  - Force renew"
+    else
+        echo "SSL Certificate Management (Let's Encrypt):"
+        echo "   ~/.acme.sh/acme.sh --cron --home ~/.acme.sh    - Manual renewal"
+        echo "   ~/.acme.sh/acme.sh --renew -d ${DOMAIN}        - Renew specific domain"
+        echo "   ~/.acme.sh/acme.sh --list                      - List certificates"
+        echo "   cat /var/log/acme-renewal.log                  - View renewal logs"
+    fi
+fi
 echo ""
 echo "Performance Check:"
 echo "   php -i | grep opcache"
