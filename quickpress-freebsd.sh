@@ -2,11 +2,11 @@
 set -e
 
 # =============================================================================
-# ClassicPress Alpine Linux Installer - VM Edition
-# End-to-end automated installer for Alpine Linux VMs using OpenRC
+# ClassicPress FreeBSD Installer - VM Edition
+# End-to-end automated installer for FreeBSD VMs using rc.d
 #
 # Usage:
-#   ./quickpress.sh [OPTIONS]
+#   ./quickpress-freebsd.sh [OPTIONS]
 #
 # SSL Options:
 #   --ssl-domain <DOMAIN>    Domain for Let's Encrypt SSL (requires --ssl-email)
@@ -15,16 +15,16 @@ set -e
 #   No flags                 No SSL (HTTP only) - default
 #
 # Examples:
-#   Let's Encrypt SSL:  ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com
-#   Self-signed SSL:    ./quickpress.sh --ssl-self-signed
-#   No SSL:             ./quickpress.sh
+#   Let's Encrypt SSL:  ./quickpress-freebsd.sh --ssl-domain example.com --ssl-email admin@example.com
+#   Self-signed SSL:    ./quickpress-freebsd.sh --ssl-self-signed
+#   No SSL:             ./quickpress-freebsd.sh
 # =============================================================================
 
 # Configuration
 DB_NAME="classicpress"
 DB_USER="cpuser"
 DB_PASS=""
-WEB_ROOT="/var/www/classicpress"
+WEB_ROOT="/usr/local/www/classicpress"
 PHP_VERSION="83"
 CREDENTIALS_FILE="/root/classicpress-login.txt"
 LOG_FILE="/var/log/classicpress-install.log"
@@ -33,7 +33,7 @@ LOG_FILE="/var/log/classicpress-install.log"
 DOMAIN=""
 EMAIL=""
 SSL_MODE=""
-SSL_DIR="/etc/ssl/acme"
+SSL_DIR="/usr/local/etc/ssl/acme"
 
 # =============================================================================
 # Parse Command Line Arguments
@@ -41,10 +41,10 @@ SSL_DIR="/etc/ssl/acme"
 
 show_help() {
     cat << HELP
-ClassicPress Alpine Linux Installer - VM Edition
+ClassicPress FreeBSD Installer - VM Edition
 
 USAGE:
-    ./quickpress.sh [OPTIONS]
+    ./quickpress-freebsd.sh [OPTIONS]
 
 SSL OPTIONS:
     --ssl-domain <DOMAIN>     Domain for Let's Encrypt SSL
@@ -64,13 +64,13 @@ OTHER OPTIONS:
 
 EXAMPLES:
     Let's Encrypt (trusted SSL certificate):
-        ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com
+        ./quickpress-freebsd.sh --ssl-domain example.com --ssl-email admin@example.com
 
     Self-signed (works with IP, browser warning):
-        ./quickpress.sh --ssl-self-signed
+        ./quickpress-freebsd.sh --ssl-self-signed
 
     No SSL (HTTP only):
-        ./quickpress.sh
+        ./quickpress-freebsd.sh
 
 For more information, visit: https://github.com/ClassicPress/ClassicPress
 HELP
@@ -118,7 +118,7 @@ done
 if [ "$SSL_MODE" = "letsencrypt" ]; then
     if [ -z "$DOMAIN" ] || [ -z "$EMAIL" ]; then
         echo "ERROR: Let's Encrypt SSL requires both --ssl-domain and --ssl-email"
-        echo "Example: ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com"
+        echo "Example: ./quickpress-freebsd.sh --ssl-domain example.com --ssl-email admin@example.com"
         exit 1
     fi
 fi
@@ -129,6 +129,20 @@ fi
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+# Timeout function for FreeBSD (timeout command may not be available)
+run_with_timeout() {
+    local timeout_sec=$1
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout_sec" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$timeout_sec" "$@"
+    else
+        # Fallback: run without timeout
+        "$@"
+    fi
 }
 
 error_exit() {
@@ -172,7 +186,7 @@ wait_for_port() {
 
 echo ""
 echo "=========================================="
-echo "ClassicPress Alpine Linux Installer"
+echo "ClassicPress FreeBSD Installer"
 echo "=========================================="
 echo ""
 
@@ -183,62 +197,193 @@ log "Starting ClassicPress installation"
 # Check if running as root
 check_root
 
-# Check if Alpine Linux
-if [ ! -f /etc/alpine-release ]; then
-    error_exit "This script is designed for Alpine Linux only"
+# Check if FreeBSD
+if [ ! -f /etc/freebsd-version ]; then
+    uname -s | grep -q "FreeBSD" || error_exit "This script is designed for FreeBSD only"
 fi
-success "Alpine Linux detected: $(cat /etc/alpine-release)"
+success "FreeBSD detected: $(uname -r)"
 
 # =============================================================================
 # STEP 1: Install Packages
 # =============================================================================
 info "Step 1/8: Installing packages..."
+info "This may take several minutes. Check $LOG_FILE for details."
 
-# Update package index
-apk update >> "$LOG_FILE" 2>&1
+# Set non-interactive mode for pkg
+export BATCH=yes
+export ASSUME_ALWAYS_YES=yes
 
-# Install all required packages
-apk add --no-cache \
+# Check if pkg is working
+if ! command -v pkg > /dev/null 2>&1; then
+    error_exit "pkg command not found. Is FreeBSD base system properly installed?"
+fi
+
+# Bootstrap pkg if needed
+if ! pkg -N > /dev/null 2>&1; then
+    info "Bootstrapping pkg..."
+    /usr/sbin/pkg bootstrap -y || error_exit "Failed to bootstrap pkg"
+fi
+
+# Update package index first
+info "Updating package repository..."
+if run_with_timeout 180 pkg update -f >> "$LOG_FILE" 2>&1; then
+    success "Package repository updated"
+else
+    echo "WARNING: pkg update took too long or failed, continuing anyway..."
+fi
+
+# Install packages in groups to better handle errors
+info "Starting package installation (this may take 5-10 minutes)..."
+
+# Core system packages
+info "Installing core packages (lighttpd, curl, etc.)..."
+run_with_timeout 300 pkg install -y \
     lighttpd \
-    "php${PHP_VERSION}" \
-    "php${PHP_VERSION}-fpm" \
-    "php${PHP_VERSION}-mysqli" \
-    "php${PHP_VERSION}-gd" \
-    "php${PHP_VERSION}-curl" \
-    "php${PHP_VERSION}-mbstring" \
-    "php${PHP_VERSION}-xml" \
-    "php${PHP_VERSION}-zip" \
-    "php${PHP_VERSION}-opcache" \
-    "php${PHP_VERSION}-session" \
-    "php${PHP_VERSION}-ctype" \
-    "php${PHP_VERSION}-json" \
-    "php${PHP_VERSION}-tokenizer" \
-    "php${PHP_VERSION}-simplexml" \
-    "php${PHP_VERSION}-dom" \
-    "php${PHP_VERSION}-fileinfo" \
-    "php${PHP_VERSION}-openssl" \
-    "php${PHP_VERSION}-pecl-redis" \
-    "php${PHP_VERSION}-exif" \
-    "php${PHP_VERSION}-iconv" \
-    "php${PHP_VERSION}-pecl-imagick" \
-    "php${PHP_VERSION}-intl" \
-    openssl \
-    socat \
-    mariadb \
-    mariadb-client \
     curl \
     unzip \
     openssl \
-    iproute2 \
-    netcat-openbsd \
-    imagemagick \
-    libgomp
+    netcat \
+    ImageMagick7-nox11 >> "$LOG_FILE" 2>&1 || {
+    echo "WARNING: Some core packages failed or timed out, continuing..."
+}
 
-# Install KeyDB from edge/testing repository
-info "Installing KeyDB from edge/testing repository..."
-apk add --no-cache keydb --repository=http://dl-cdn.alpinelinux.org/alpine/edge/testing >> "$LOG_FILE" 2>&1
+# PHP and core extensions
+info "Installing PHP ${PHP_VERSION}..."
+run_with_timeout 600 pkg install -y \
+    php${PHP_VERSION} \
+    php${PHP_VERSION}-curl \
+    php${PHP_VERSION}-dom \
+    php${PHP_VERSION}-exif \
+    php${PHP_VERSION}-fileinfo \
+    php${PHP_VERSION}-filter \
+    php${PHP_VERSION}-gd \
+    php${PHP_VERSION}-iconv \
+    php${PHP_VERSION}-intl \
+    php${PHP_VERSION}-mbstring \
+    php${PHP_VERSION}-mysqli \
+    php${PHP_VERSION}-opcache \
+    php${PHP_VERSION}-pdo \
+    php${PHP_VERSION}-pdo_mysql \
+    php${PHP_VERSION}-phar \
+    php${PHP_VERSION}-session \
+    php${PHP_VERSION}-simplexml \
+    php${PHP_VERSION}-tokenizer \
+    php${PHP_VERSION}-xml \
+    php${PHP_VERSION}-xmlreader \
+    php${PHP_VERSION}-xmlwriter \
+    php${PHP_VERSION}-zip \
+    php${PHP_VERSION}-zlib >> "$LOG_FILE" 2>&1 || {
+    echo "WARNING: Some PHP packages failed or timed out, continuing..."
+}
+
+# Try to install pecl-redis (may have different naming)
+info "Installing Redis PHP extension..."
+run_with_timeout 120 pkg install -y php${PHP_VERSION}-pecl-redis >> "$LOG_FILE" 2>&1 || \
+run_with_timeout 120 pkg install -y php${PHP_VERSION}-redis >> "$LOG_FILE" 2>&1 || \
+echo "WARNING: PHP Redis extension not available, will try later"
+
+# Database and cache
+info "Installing database server (MySQL or MariaDB) and Redis..."
+
+# First, search for available database packages
+echo "Searching for available database packages..." >> "$LOG_FILE"
+pkg search -qE '^(mysql|mariadb).*server$' >> "$LOG_FILE" 2>&1 || true
+
+# Try mysql82-server first (FreeBSD 14.x default), fallback to MariaDB and others
+DB_INSTALLED=0
+if run_with_timeout 300 pkg install -y mysql82-server >> "$LOG_FILE" 2>&1; then
+    success "MySQL 8.2 server installed"
+    DB_INSTALLED=1
+elif run_with_timeout 300 pkg install -y mysql80-server >> "$LOG_FILE" 2>&1; then
+    success "MySQL 8.0 server installed"
+    DB_INSTALLED=1
+elif run_with_timeout 300 pkg install -y mariadb106-server >> "$LOG_FILE" 2>&1; then
+    success "MariaDB 10.6 server installed"
+    DB_INSTALLED=1
+elif run_with_timeout 300 pkg install -y mariadb105-server >> "$LOG_FILE" 2>&1; then
+    success "MariaDB 10.5 server installed"
+    DB_INSTALLED=1
+elif run_with_timeout 300 pkg install -y mysql57-server >> "$LOG_FILE" 2>&1; then
+    success "MySQL 5.7 server installed"
+    DB_INSTALLED=1
+fi
+
+if [ "$DB_INSTALLED" -eq 0 ]; then
+    echo "ERROR: Could not install any MySQL/MariaDB server package"
+    echo "Available packages:"
+    pkg search -qE '^(mysql|mariadb).*server$' 2>/dev/null || echo "  (search failed)"
+fi
+
+# Install Redis
+info "Installing Redis..."
+run_with_timeout 120 pkg install -y redis >> "$LOG_FILE" 2>&1 || {
+    echo "WARNING: Redis installation may have issues, continuing..."
+}
+
+# Verify critical packages
+info "Verifying installations..."
+
+# Check PHP
+PHP_BIN=""
+if command -v php > /dev/null 2>&1; then
+    PHP_BIN="php"
+elif command -v php83 > /dev/null 2>&1; then
+    PHP_BIN="php83"
+    ln -sf $(command -v php83) /usr/local/bin/php 2>/dev/null || true
+fi
+
+if [ -n "$PHP_BIN" ]; then
+    success "PHP found: $PHP_BIN"
+else
+    error_exit "PHP not found after installation"
+fi
+
+# Check Lighttpd
+if ! command -v lighttpd > /dev/null 2>&1; then
+    error_exit "Lighttpd not found after installation"
+fi
+
+# Check MySQL/MariaDB (various possible binary names)
+MYSQL_CMD=""
+for cmd in mysql mysql82 mariadb; do
+    if command -v $cmd > /dev/null 2>&1; then
+        MYSQL_CMD=$cmd
+        success "Database client found: $cmd"
+        break
+    fi
+done
+
+if [ -z "$MYSQL_CMD" ]; then
+    # Check if server binaries exist
+    if [ -x /usr/local/libexec/mysqld ] || [ -x /usr/local/sbin/mysqld ] || \
+       [ -x /usr/local/libexec/mysql82/mysqld ] || [ -x /usr/local/libexec/mariadbd ] || \
+       [ -x /usr/local/sbin/mariadbd ]; then
+        success "Database server binaries found"
+        MYSQL_CMD="mysql"
+    else
+        echo ""
+        echo "ERROR: MySQL/MariaDB not found after installation."
+        echo ""
+        echo "Debug info:"
+        echo "  pkg info | grep -E 'mysql|mariadb':"
+        pkg info 2>/dev/null | grep -iE 'mysql|mariadb' || echo "    (no database packages found)"
+        echo ""
+        echo "  Available binaries:"
+        ls -la /usr/local/bin/mysql* /usr/local/sbin/mysql* /usr/local/bin/mariadb* /usr/local/sbin/mariadb* 2>/dev/null || echo "    (no binaries found)"
+        echo ""
+        echo "Try running manually:"
+        echo "  pkg install -y mysql82-server"
+        echo "  or"
+        echo "  pkg install -y mariadb106-server"
+        echo ""
+        exit 1
+    fi
+fi
 
 success "Packages installed"
+
+# Export MYSQL_CMD for later use
+export MYSQL_CMD
 
 # Generate database password now that openssl is available
 if [ -z "$DB_PASS" ]; then
@@ -246,23 +391,25 @@ if [ -z "$DB_PASS" ]; then
 fi
 
 # =============================================================================
-# STEP 2: Configure and Start MariaDB with Performance Optimizations
+# STEP 2: Configure and Start MySQL with Performance Optimizations
 # =============================================================================
-info "Step 2/8: Configuring MariaDB with performance optimizations..."
+info "Step 2/8: Configuring MySQL with performance optimizations..."
 
-# Create MariaDB directories
-mkdir -p /run/mysqld
-chown mysql:mysql /run/mysqld
+# Create MySQL directories
+mkdir -p /var/db/mysql
+mkdir -p /var/run/mysql
+chown mysql:mysql /var/db/mysql
+chown mysql:mysql /var/run/mysql
 
 # Get system memory for buffer pool calculation (use 50% of RAM for InnoDB)
-TOTAL_MEM_MB=$(free -m | awk '/^Mem:/{print $2}')
+TOTAL_MEM_MB=$(sysctl -n hw.physmem | awk '{print int($1/1024/1024)}')
 INNODB_BUFFER_POOL=$((TOTAL_MEM_MB * 50 / 100))
 if [ "$INNODB_BUFFER_POOL" -lt 128 ]; then
     INNODB_BUFFER_POOL=128
 fi
 
-# Configure MariaDB for performance
-cat > /etc/my.cnf.d/mariadb-server.cnf << EOF
+# Configure MySQL for performance
+cat > /usr/local/etc/mysql/my.cnf << EOF
 [mysqld]
 bind-address = 127.0.0.1
 port = 3306
@@ -284,7 +431,7 @@ innodb_read_io_threads = 4
 innodb_write_io_threads = 4
 innodb_io_capacity = 2000
 
-# Query Cache (if available in MariaDB version)
+# Query Cache
 query_cache_type = 1
 query_cache_size = 64M
 query_cache_limit = 2M
@@ -298,7 +445,6 @@ connect_timeout = 10
 
 # Thread Settings
 thread_cache_size = 16
-thread_pool_size = 4
 
 # Table Settings
 table_open_cache = 4000
@@ -314,62 +460,107 @@ join_buffer_size = 1M
 
 # Logging (minimal for performance)
 slow_query_log = 1
-slow_query_log_file = /var/log/mysql/slow.log
+slow_query_log_file = /var/db/mysql/slow.log
 long_query_time = 2
-log_error = /var/log/mysql/error.log
+log_error = /var/db/mysql/error.log
 
 # Disable unwanted features
 skip-name-resolve
 skip-external-locking
-skip-slave-start
 
-[mariadb]
-# Additional MariaDB-specific settings
+[mysql]
+default-character-set = utf8mb4
+
+[client]
+default-character-set = utf8mb4
 EOF
 
-# Create log directory
-mkdir -p /var/log/mysql
-chown mysql:mysql /var/log/mysql
+# Enable MySQL/MariaDB in rc.conf (try different service names)
+sysrc mysql_enable="YES" >> "$LOG_FILE" 2>&1 || \
+sysrc mysql82_enable="YES" >> "$LOG_FILE" 2>&1 || \
+sysrc mysqld_enable="YES" >> "$LOG_FILE" 2>&1 || \
+sysrc mariadb_enable="YES" >> "$LOG_FILE" 2>&1 || true
 
-# Initialize MariaDB if needed
-if [ ! -d /var/lib/mysql/mysql ]; then
-    info "Initializing MariaDB data directory..."
-    mysql_install_db --user=mysql --datadir=/var/lib/mysql --rpm >> "$LOG_FILE" 2>&1
+# Initialize MySQL/MariaDB if needed
+if [ ! -d /var/db/mysql/mysql ]; then
+    info "Initializing database data directory..."
+    # Try different initialization methods
+    if command -v mysql_install_db > /dev/null 2>&1; then
+        mysql_install_db --user=mysql --basedir=/usr/local --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1
+    elif command -v mysqld > /dev/null 2>&1; then
+        mysqld --initialize-insecure --user=mysql --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1
+    elif command -v mariadb-install-db > /dev/null 2>&1; then
+        mariadb-install-db --user=mysql --basedir=/usr/local --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1
+    elif command -v mariadbd > /dev/null 2>&1; then
+        mariadbd --initialize-insecure --user=mysql --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1
+    else
+        echo "WARNING: Could not find database initialization tool"
+    fi
 fi
 
-# Enable MariaDB
-rc-update add mariadb default >> "$LOG_FILE" 2>&1
-
-# Clean up any stale state from mysql_install_db
+# Clean up any stale state
 pkill -9 mysqld 2>/dev/null || true
-pkill -9 mariadb 2>/dev/null || true
-rm -f /var/lib/mysql/*.pid /run/mysqld/mysqld.sock /run/openrc/starting/mariadb /run/openrc/started/mariadb 2>/dev/null || true
+pkill -9 mysql 2>/dev/null || true
+rm -f /var/db/mysql/*.pid /var/run/mysql/*.sock 2>/dev/null || true
 sleep 2
 
-# Start MariaDB
-service mariadb start >> "$LOG_FILE" 2>&1 || {
-    # If service start fails, try direct start
-    /usr/bin/mysqld_safe --datadir=/var/lib/mysql &
+# Start MySQL/MariaDB (try different service names)
+info "Starting database server..."
+if service mysql-server start >> "$LOG_FILE" 2>&1; then
+    success "Started via mysql-server"
+elif service mysql82-server start >> "$LOG_FILE" 2>&1; then
+    success "Started via mysql82-server"
+elif service mysql start >> "$LOG_FILE" 2>&1; then
+    success "Started via mysql"
+elif service mysqld start >> "$LOG_FILE" 2>&1; then
+    success "Started via mysqld"
+elif service mariadb start >> "$LOG_FILE" 2>&1; then
+    success "Started via mariadb"
+elif service mariadb-server start >> "$LOG_FILE" 2>&1; then
+    success "Started via mariadb-server"
+else
+    # Try direct start as fallback
+    info "Trying direct database start..."
+    if [ -x /usr/local/libexec/mysqld ]; then
+        /usr/local/libexec/mysqld --user=mysql >> "$LOG_FILE" 2>&1 &
+    elif [ -x /usr/local/sbin/mysqld ]; then
+        /usr/local/sbin/mysqld --user=mysql >> "$LOG_FILE" 2>&1 &
+    elif [ -x /usr/local/libexec/mysql82/mysqld ]; then
+        /usr/local/libexec/mysql82/mysqld --user=mysql >> "$LOG_FILE" 2>&1 &
+    elif [ -x /usr/local/libexec/mariadbd ]; then
+        /usr/local/libexec/mariadbd --user=mysql >> "$LOG_FILE" 2>&1 &
+    elif [ -x /usr/local/sbin/mariadbd ]; then
+        /usr/local/sbin/mariadbd --user=mysql >> "$LOG_FILE" 2>&1 &
+    fi
     sleep 5
-}
+fi
 
-# Wait for MariaDB to be ready
-info "Waiting for MariaDB to start..."
+# Wait for MySQL to be ready
+info "Waiting for MySQL to start..."
 for i in $(seq 1 30); do
     if nc -z 127.0.0.1 3306 2>/dev/null; then
-        success "MariaDB is running"
+        success "MySQL is running"
         break
     fi
     sleep 2
 done
 
-# Check if MariaDB port is open
+# Check if MySQL port is open
 if ! nc -z 127.0.0.1 3306 2>/dev/null; then
-    error_exit "MariaDB failed to start"
+    error_exit "MySQL failed to start"
 fi
 
-# Create database and user
-mariadb -u root << EOF
+# Create database and user (use detected MySQL command)
+MYSQL_CLIENT="${MYSQL_CMD:-mysql}"
+
+# Check if MySQL is using socket or TCP
+if [ -S /var/run/mysql/mysql.sock ] || [ -S /tmp/mysql.sock ]; then
+    MYSQL_OPTS="-u root"
+else
+    MYSQL_OPTS="-u root -h 127.0.0.1"
+fi
+
+$MYSQL_CLIENT $MYSQL_OPTS << EOF
 CREATE DATABASE IF NOT EXISTS ${DB_NAME} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 DROP USER IF EXISTS '${DB_USER}'@'localhost';
 DROP USER IF EXISTS '${DB_USER}'@'127.0.0.1';
@@ -379,31 +570,26 @@ FLUSH PRIVILEGES;
 EOF
 
 # Verify database exists
-if ! mariadb -u root -e "USE ${DB_NAME};" 2>/dev/null; then
+if ! $MYSQL_CLIENT $MYSQL_OPTS -e "USE ${DB_NAME};" 2>/dev/null; then
     error_exit "Failed to create database"
 fi
 
-success "MariaDB configured (${INNODB_BUFFER_POOL}MB buffer pool) and database created"
+success "MySQL configured (${INNODB_BUFFER_POOL}MB buffer pool) and database created"
 
 # =============================================================================
-# STEP 3: Configure KeyDB (Redis-compatible high-performance cache)
+# STEP 3: Configure Redis (Object Cache)
 # =============================================================================
-info "Step 3/8: Configuring KeyDB (object cache)..."
+info "Step 3/8: Configuring Redis (object cache)..."
 
-# Calculate KeyDB memory (use 10% of total RAM for object caching)
-KEYDB_MEM_MB=$((TOTAL_MEM_MB * 10 / 100))
-if [ "$KEYDB_MEM_MB" -lt 64 ]; then
-    KEYDB_MEM_MB=64
+# Calculate Redis memory (use 10% of total RAM for object caching)
+REDIS_MEM_MB=$((TOTAL_MEM_MB * 10 / 100))
+if [ "$REDIS_MEM_MB" -lt 64 ]; then
+    REDIS_MEM_MB=64
 fi
 
-# Create KeyDB configuration directory
-mkdir -p /etc/keydb
-mkdir -p /var/lib/keydb
-mkdir -p /var/log/keydb
-
-# Configure KeyDB for maximum performance
-cat > /etc/keydb.conf << EOF
-# KeyDB Configuration - High Performance Mode
+# Create Redis configuration
+cat > /usr/local/etc/redis.conf << EOF
+# Redis Configuration - High Performance Mode
 bind 127.0.0.1
 port 6379
 tcp-backlog 511
@@ -411,35 +597,21 @@ timeout 300
 tcp-keepalive 300
 
 # Memory Settings
-maxmemory ${KEYDB_MEM_MB}mb
+maxmemory ${REDIS_MEM_MB}mb
 maxmemory-policy allkeys-lru
 maxmemory-samples 5
 
 # Persistence (disable for pure cache, enable for durability)
-# For ClassicPress object cache, we can disable persistence for speed
 save ""
-# save 900 1
-# save 300 10
-# save 60 10000
 
 stop-writes-on-bgsave-error yes
 rdbcompression yes
 rdbchecksum yes
 dbfilename dump.rdb
-dir /var/lib/keydb
+dir /var/db/redis
 
 # Append Only File (AOF) - disable for cache-only mode
 appendonly no
-
-# KeyDB-specific optimizations (multi-threaded)
-server-threads 4
-server-thread-affinity true
-
-# appendfilename "appendonly.aof"
-# appendfsync everysec
-# no-appendfsync-on-rewrite no
-# auto-aof-rewrite-percentage 100
-# auto-aof-rewrite-min-size 64mb
 
 # Client output buffer limits
 client-output-buffer-limit normal 0 0 0
@@ -461,91 +633,64 @@ set-max-intset-entries 512
 zset-max-ziplist-entries 128
 zset-max-ziplist-value 64
 
-# HyperLogLog settings
-hll-sparse-max-bytes 3000
-
-# Stream settings
-stream-node-max-bytes 4096
-stream-node-max-entries 100
-
 # Active rehashing
 activerehashing yes
-
-# Client query buffer limit
-client-query-buffer-limit 1gb
-
-# Protocol limits
-proto-max-bulk-len 512mb
 
 # Slow log
 slowlog-log-slower-than 10000
 slowlog-max-len 128
 
-# Latency monitoring
-latency-monitor-threshold 0
-
-# Event notification
-notify-keyspace-events ""
-
-# Kernel settings
-oom-score-adj no
-oom-score-adj-values 0 200 800
-
-# Logging
-loglevel notice
-logfile /var/log/keydb/keydb.log
-
 # Databases (ClassicPress uses DB 0 by default)
 databases 16
 
-# Show ASCII logo on startup (why not?)
-always-show-logo yes
+# Logging
+loglevel notice
+logfile /var/log/redis/redis.log
 EOF
 
-# Set permissions
-chown -R keydb:keydb /var/lib/keydb 2>/dev/null || chown -R root:root /var/lib/keydb
-chown -R keydb:keydb /var/log/keydb 2>/dev/null || chown -R root:root /var/log/keydb
-chmod 755 /var/lib/keydb
-chmod 755 /var/log/keydb
+# Create Redis directories
+mkdir -p /var/db/redis
+mkdir -p /var/log/redis
+chown redis:redis /var/db/redis 2>/dev/null || chown root:wheel /var/db/redis
+chown redis:redis /var/log/redis 2>/dev/null || chown root:wheel /var/log/redis
+chmod 755 /var/db/redis
+chmod 755 /var/log/redis
 
-# Create log file with proper permissions
-touch /var/log/keydb/keydb.log
-chown keydb:keydb /var/log/keydb/keydb.log 2>/dev/null || chown root:root /var/log/keydb/keydb.log
-chmod 644 /var/log/keydb/keydb.log
+# Enable Redis in rc.conf
+sysrc redis_enable="YES" >> "$LOG_FILE" 2>&1 || true
 
-# Enable KeyDB service
-rc-update add keydb default >> "$LOG_FILE" 2>&1
+# Create Redis directories
+mkdir -p /var/db/redis
+mkdir -p /var/log/redis
+mkdir -p /var/run/redis
+chown redis:redis /var/db/redis 2>/dev/null || chown root:wheel /var/db/redis
+chown redis:redis /var/log/redis 2>/dev/null || chown root:wheel /var/log/redis
+chmod 755 /var/db/redis
+chmod 755 /var/log/redis
 
-# Start KeyDB
-pkill -9 keydb-server 2>/dev/null || true
-rm -f /var/run/keydb/keydb-server.pid 2>/dev/null || true
+# Start Redis
+pkill -9 redis-server 2>/dev/null || true
+rm -f /var/run/redis/redis.pid 2>/dev/null || true
 sleep 2
 
-# Start KeyDB via service (ignore "already starting" warning)
-info "Starting KeyDB service..."
-service keydb start >> "$LOG_FILE" 2>&1 || true
+service redis start >> "$LOG_FILE" 2>&1 || \
+service redis-server start >> "$LOG_FILE" 2>&1 || \
+/usr/local/bin/redis-server /usr/local/etc/redis.conf >> "$LOG_FILE" 2>&1 &
 
-# Also try direct start if service fails
-if ! pgrep -x keydb-server > /dev/null 2>&1; then
-    info "Trying direct KeyDB start..."
-    /usr/bin/keydb-server /etc/keydb.conf --daemonize yes >> "$LOG_FILE" 2>&1 || true
-    sleep 2
-fi
-
-# Wait for KeyDB to be ready
-info "Waiting for KeyDB to start..."
-KEYDB_READY=0
+# Wait for Redis to be ready
+info "Waiting for Redis to start..."
+REDIS_READY=0
 for i in $(seq 1 30); do
-    if keydb-cli ping 2>/dev/null | grep -q "PONG"; then
-        success "KeyDB running (${KEYDB_MEM_MB}MB memory limit, 4 threads)"
-        KEYDB_READY=1
+    if redis-cli ping 2>/dev/null | grep -q "PONG"; then
+        success "Redis running (${REDIS_MEM_MB}MB memory limit)"
+        REDIS_READY=1
         break
     fi
     sleep 1
 done
 
-if [ "$KEYDB_READY" -eq 0 ]; then
-    echo "WARNING: KeyDB may not be running properly"
+if [ "$REDIS_READY" -eq 0 ]; then
+    echo "WARNING: Redis may not be running properly"
 fi
 
 # =============================================================================
@@ -579,31 +724,68 @@ success "ClassicPress ${CP_VERSION} downloaded"
 # =============================================================================
 info "Step 5/8: Configuring PHP-FPM with optimizations..."
 
-# Configure PHP-FPM to use Unix socket (faster than TCP)
-mkdir -p /run/php-fpm
-sed -i 's|^listen =.*|listen = /run/php-fpm/php-fpm.sock|' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
-sed -i 's/^user =.*/user = lighttpd/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
-sed -i 's/^group =.*/group = lighttpd/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
-sed -i 's/^;listen.owner =.*/listen.owner = lighttpd/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
-sed -i 's/^;listen.group =.*/listen.group = lighttpd/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
-sed -i 's/^;listen.mode =.*/listen.mode = 0660/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
+# Configure PHP-FPM to use Unix socket
+mkdir -p /var/run/php-fpm
+chown www:www /var/run/php-fpm
 
-# Tune PHP-FPM Process Manager for performance
-sed -i 's/^pm =.*/pm = dynamic/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
-sed -i 's/^pm.max_children =.*/pm.max_children = 50/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
-sed -i 's/^pm.start_servers =.*/pm.start_servers = 5/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
-sed -i 's/^pm.min_spare_servers =.*/pm.min_spare_servers = 5/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
-sed -i 's/^pm.max_spare_servers =.*/pm.max_spare_servers = 35/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
-sed -i 's/^;pm.max_requests =.*/pm.max_requests = 500/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
+# Find or create PHP-FPM config directory
+PHP_FPM_DIR="/usr/local/etc/php-fpm.d"
+if [ ! -d "$PHP_FPM_DIR" ]; then
+    mkdir -p "$PHP_FPM_DIR"
+fi
 
-# Increase request timeout to prevent connection resets
-sed -i 's/^;request_terminate_timeout =.*/request_terminate_timeout = 300s/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
+# Backup existing config if present
+if [ -f "$PHP_FPM_DIR/www.conf" ]; then
+    cp "$PHP_FPM_DIR/www.conf" "$PHP_FPM_DIR/www.conf.bak" 2>/dev/null || true
+fi
 
-# Increase buffer sizes for admin panel
-sed -i 's/^;output_buffering =.*/output_buffering = 4096/' /etc/php${PHP_VERSION}/php-fpm.d/www.conf
+# Also ensure main php-fpm.conf includes the pool directory
+if [ -f "/usr/local/etc/php-fpm.conf" ]; then
+    if ! grep -q "php-fpm.d" /usr/local/etc/php-fpm.conf 2>/dev/null; then
+        echo "include=/usr/local/etc/php-fpm.d/*.conf" >> /usr/local/etc/php-fpm.conf
+    fi
+elif [ -f "/usr/local/etc/php-fpm.conf.default" ]; then
+    cp /usr/local/etc/php-fpm.conf.default /usr/local/etc/php-fpm.conf
+    echo "include=/usr/local/etc/php-fpm.d/*.conf" >> /usr/local/etc/php-fpm.conf
+fi
 
-# Configure OPcache with JIT for maximum performance
-cat >> /etc/php${PHP_VERSION}/conf.d/00_opcache.ini << 'EOF'
+cat > "$PHP_FPM_DIR/www.conf" << EOF
+[www]
+user = www
+group = www
+listen = /var/run/php-fpm/php-fpm.sock
+listen.owner = www
+listen.group = www
+listen.mode = 0660
+
+pm = dynamic
+pm.max_children = 50
+pm.start_servers = 5
+pm.min_spare_servers = 5
+pm.max_spare_servers = 35
+pm.max_requests = 500
+
+request_terminate_timeout = 300s
+request_slowlog_timeout = 30s
+slowlog = /var/log/php-fpm/slow.log
+
+; Security
+security.limit_extensions = .php
+
+; Environment
+env[HOSTNAME] = \$HOSTNAME
+env[PATH] = /usr/local/bin:/usr/bin:/bin
+env[TMP] = /tmp
+env[TMPDIR] = /tmp
+env[TEMP] = /tmp
+EOF
+
+# Create PHP-FPM log directory
+mkdir -p /var/log/php-fpm
+chown www:www /var/log/php-fpm
+
+# Configure OPcache with JIT
+cat > /usr/local/etc/php/ext-20-opcache.ini << EOF
 ; OPcache Configuration
 opcache.enable=1
 opcache.enable_cli=1
@@ -620,8 +802,8 @@ opcache.jit_buffer_size=128M
 opcache.jit=tracing
 EOF
 
-# Additional PHP optimizations for ClassicPress/WordPress
-cat >> /etc/php${PHP_VERSION}/conf.d/99-quickpress.ini << 'EOF'
+# Additional PHP optimizations
+cat > /usr/local/etc/php/99-quickpress.ini << EOF
 ; PHP Performance Optimizations
 max_execution_time = 300
 max_input_time = 300
@@ -635,7 +817,7 @@ max_file_uploads = 20
 realpath_cache_size = 16M
 realpath_cache_ttl = 120
 
-; Increase limits for admin panel (prevents connection resets)
+; Increase limits for admin panel
 max_input_nesting_level = 64
 max_input_vars = 5000
 
@@ -648,43 +830,62 @@ file_uploads = On
 ; Temporary upload directory
 upload_tmp_dir = /tmp
 
-; Maximum upload file size (must be <= post_max_size)
-upload_max_filesize = 64M
-
 ; Disable dangerous functions for security
 disable_functions = pcntl_alarm,pcntl_fork,pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,pcntl_wifcontinued,pcntl_wexitstatus,pcntl_wtermsig,pcntl_wstopsig,pcntl_signal,pcntl_signal_get_handler,pcntl_signal_dispatch,pcntl_get_last_error,pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_exec,pcntl_getpriority,pcntl_setpriority,pcntl_async_signals,passthru,system,exec,shell_exec,popen,proc_open
 EOF
 
-# Enable PHP-FPM
-rc-update add "php-fpm${PHP_VERSION}" default >> "$LOG_FILE" 2>&1
+# Enable PHP-FPM in rc.conf (try multiple naming conventions)
+sysrc php_fpm_enable="YES" >> "$LOG_FILE" 2>&1 || \
+sysrc php-fpm_enable="YES" >> "$LOG_FILE" 2>&1 || true
 
 # Clean up and start PHP-FPM
-pkill -9 "php-fpm" 2>/dev/null || true
-rm -f /run/openrc/starting/php-fpm${PHP_VERSION} /run/openrc/started/php-fpm${PHP_VERSION} 2>/dev/null || true
+pkill -9 php-fpm 2>/dev/null || true
+pkill -9 php-fpm83 2>/dev/null || true
 sleep 1
 
-# Start PHP-FPM directly
-/usr/sbin/php-fpm${PHP_VERSION} -F >> "$LOG_FILE" 2>&1 &
-sleep 3
-
-# Verify it's running
-if ! pgrep -x php-fpm${PHP_VERSION} > /dev/null 2>&1; then
-    # Try service start as fallback
-    service "php-fpm${PHP_VERSION}" start >> "$LOG_FILE" 2>&1 || true
+# Start PHP-FPM (try different service names and methods)
+info "Starting PHP-FPM..."
+if service php-fpm start >> "$LOG_FILE" 2>&1; then
+    success "PHP-FPM started via service php-fpm"
+elif service php-fpm83 start >> "$LOG_FILE" 2>&1; then
+    success "PHP-FPM started via service php-fpm83"
+elif service php_fpm start >> "$LOG_FILE" 2>&1; then
+    success "PHP-FPM started via service php_fpm"
+else
+    # Try direct start as fallback
+    info "Trying direct PHP-FPM start..."
+    if [ -x /usr/local/sbin/php-fpm ]; then
+        /usr/local/sbin/php-fpm -y /usr/local/etc/php-fpm.conf >> "$LOG_FILE" 2>&1 &
+    elif [ -x /usr/local/sbin/php-fpm83 ]; then
+        /usr/local/sbin/php-fpm83 -y /usr/local/etc/php-fpm.conf >> "$LOG_FILE" 2>&1 &
+    fi
     sleep 3
 fi
 
 # Wait for socket to be created
+info "Waiting for PHP-FPM socket..."
+PHP_FPM_READY=0
 for i in $(seq 1 30); do
-    if [ -S /run/php-fpm/php-fpm.sock ]; then
+    if [ -S /var/run/php-fpm/php-fpm.sock ]; then
         success "PHP-FPM socket created"
+        PHP_FPM_READY=1
         break
+    fi
+    if pgrep -x "php-fpm" > /dev/null 2>&1 || pgrep -x "php-fpm83" > /dev/null 2>&1; then
+        # Process is running but socket might be elsewhere
+        if [ -S /tmp/php-fpm.sock ]; then
+            ln -sf /tmp/php-fpm.sock /var/run/php-fpm/php-fpm.sock 2>/dev/null || true
+            success "PHP-FPM socket linked"
+            PHP_FPM_READY=1
+            break
+        fi
     fi
     sleep 1
 done
 
-if [ ! -S /run/php-fpm/php-fpm.sock ]; then
-    error_exit "PHP-FPM socket not created"
+if [ "$PHP_FPM_READY" -eq 0 ]; then
+    echo "WARNING: PHP-FPM socket not found, but continuing..."
+    echo "  Check: tail -f /var/log/php-fpm.log"
 fi
 
 success "PHP-FPM configured with OPcache + JIT"
@@ -711,7 +912,7 @@ cat > wp-config.php << EOF
 <?php
 /**
  * ClassicPress Configuration File
- * Generated by QuickPress Installer
+ * Generated by QuickPress FreeBSD Installer
  */
 
 // Database settings
@@ -758,12 +959,12 @@ define('DISABLE_WP_CRON', true);
 // Disable script concatenation in admin (faster admin)
 define('CONCATENATE_SCRIPTS', false);
 
-// Enable object caching with Redis/Redis
+// Enable object caching with Redis
 define('WP_CACHE', true);
 define('WP_REDIS_DISABLE_METRICS', true);
 define('WP_REDIS_DISABLE_PRELOAD', false);
 
-// Redis/Redis Configuration
+// Redis Configuration
 define('WP_REDIS_HOST', '127.0.0.1');
 define('WP_REDIS_PORT', 6379);
 define('WP_REDIS_DATABASE', 0);
@@ -772,7 +973,6 @@ define('WP_REDIS_READ_TIMEOUT', 1);
 define('WP_REDIS_RETRY_INTERVAL', 100);
 
 // Alternative: Use Redis Object Cache plugin constants
-// These work with most Redis/Redis object cache plugins
 define('REDIS_HOST', '127.0.0.1');
 define('REDIS_PORT', 6379);
 
@@ -786,7 +986,6 @@ define('AUTOMATIC_UPDATER_DISABLED', false);
 define('WP_DEBUG', false);
 define('WP_DEBUG_LOG', false);
 define('WP_DEBUG_DISPLAY', false);
-// To enable debugging, set WP_DEBUG to true and check ${WEB_ROOT}/wp-content/debug.log
 
 // Absolute path to the WordPress directory
 if (!defined('ABSPATH')) {
@@ -801,42 +1000,40 @@ EOF
 info "Setting file permissions for uploads..."
 
 # Set ownership on web root (recursive)
-chown -R lighttpd:lighttpd ${WEB_ROOT}
+chown -R www:www ${WEB_ROOT}
 chmod 644 ${WEB_ROOT}/wp-config.php
 
-# Fix wp-content directory permissions - parent MUST be writable
+# Fix wp-content directory permissions
 mkdir -p ${WEB_ROOT}/wp-content
-chown lighttpd:lighttpd ${WEB_ROOT}/wp-content
-chmod 775 ${WEB_ROOT}/wp-content  # 775 allows group write for uploads
+chown www:www ${WEB_ROOT}/wp-content
+chmod 775 ${WEB_ROOT}/wp-content
 
-# Create uploads directory with proper permissions for file uploads
+# Create uploads directory with proper permissions
 mkdir -p ${WEB_ROOT}/wp-content/uploads
-chown lighttpd:lighttpd ${WEB_ROOT}/wp-content/uploads
-chmod 775 ${WEB_ROOT}/wp-content/uploads  # 775 with setgid for inheritance
-
-# Set setgid bit on uploads directory so new files inherit group
+chown www:www ${WEB_ROOT}/wp-content/uploads
+chmod 775 ${WEB_ROOT}/wp-content/uploads
 chmod g+s ${WEB_ROOT}/wp-content/uploads
 
 # Also fix upgrade directory permissions
 mkdir -p ${WEB_ROOT}/wp-content/upgrade
-chown lighttpd:lighttpd ${WEB_ROOT}/wp-content/upgrade
+chown www:www ${WEB_ROOT}/wp-content/upgrade
 chmod 775 ${WEB_ROOT}/wp-content/upgrade
 
 # Fix plugins directory permissions
 mkdir -p ${WEB_ROOT}/wp-content/plugins
-chown -R lighttpd:lighttpd ${WEB_ROOT}/wp-content/plugins
+chown -R www:www ${WEB_ROOT}/wp-content/plugins
 chmod 755 ${WEB_ROOT}/wp-content/plugins
 
 # Fix themes directory permissions
 mkdir -p ${WEB_ROOT}/wp-content/themes
-chown -R lighttpd:lighttpd ${WEB_ROOT}/wp-content/themes
+chown -R www:www ${WEB_ROOT}/wp-content/themes
 chmod 755 ${WEB_ROOT}/wp-content/themes
 
-# Create test upload directory structure to verify permissions work
+# Create test upload directory structure
 TEST_YEAR=$(date +%Y)
 TEST_MONTH=$(date +%m)
 mkdir -p "${WEB_ROOT}/wp-content/uploads/${TEST_YEAR}/${TEST_MONTH}"
-chown -R lighttpd:lighttpd "${WEB_ROOT}/wp-content/uploads"
+chown -R www:www "${WEB_ROOT}/wp-content/uploads"
 chmod -R 775 "${WEB_ROOT}/wp-content/uploads"
 
 # Verify permissions
@@ -846,18 +1043,18 @@ else
     echo "WARNING: Upload directory may not be writable"
 fi
 
-# Fix /tmp permissions for PHP uploads (critical for VM environments)
+# Fix /tmp permissions for PHP uploads
 chmod 1777 /tmp
-chown root:root /tmp
+chown root:wheel /tmp
 
-# Create a permission fix script for future use
+# Create a permission fix script
 cat > /usr/local/bin/fix-classicpress-permissions << 'PERMEOF'
 #!/bin/sh
 # Fix ClassicPress/WordPress permissions
 # Run this if uploads fail or permissions get corrupted
 
-WEB_ROOT="/var/www/classicpress"
-PHP_USER="lighttpd"
+WEB_ROOT="/usr/local/www/classicpress"
+PHP_USER="www"
 
 echo "Fixing ClassicPress permissions..."
 
@@ -879,14 +1076,14 @@ chmod g+s ${WEB_ROOT}/wp-content/uploads
 # Fix PHP files
 find ${WEB_ROOT} -type f -name "*.php" -exec chmod 644 {} \;
 
-# Fix uploaded files (images, etc.)
+# Fix uploaded files
 find ${WEB_ROOT}/wp-content/uploads -type f -exec chmod 664 {} \; 2>/dev/null || true
 
 # Fix /tmp
 chmod 1777 /tmp
 
 echo "Permissions fixed. Testing upload directory..."
-if sudo -u ${PHP_USER} touch ${WEB_ROOT}/wp-content/uploads/.test 2>/dev/null; then
+if su -m ${PHP_USER} -c "touch ${WEB_ROOT}/wp-content/uploads/.test" 2>/dev/null; then
     rm -f ${WEB_ROOT}/wp-content/uploads/.test
     echo "SUCCESS: Upload directory is writable"
 else
@@ -896,14 +1093,6 @@ fi
 PERMEOF
 chmod +x /usr/local/bin/fix-classicpress-permissions
 
-# Create PHP temp directory if specified differently
-PHP_TEMP_DIR=$(php${PHP_VERSION} -r 'echo sys_get_temp_dir();' 2>/dev/null) || PHP_TEMP_DIR="/tmp"
-if [ "$PHP_TEMP_DIR" != "/tmp" ]; then
-    mkdir -p "$PHP_TEMP_DIR"
-    chmod 1777 "$PHP_TEMP_DIR"
-    chown root:root "$PHP_TEMP_DIR"
-fi
-
 success "wp-config.php created"
 
 # =============================================================================
@@ -912,16 +1101,16 @@ success "wp-config.php created"
 info "Step 7/8: Configuring Lighttpd with performance optimizations..."
 
 # Create Lighttpd configuration
-cat > /etc/lighttpd/lighttpd.conf << EOF
+cat > /usr/local/etc/lighttpd/lighttpd.conf << EOF
 # Lighttpd Performance Configuration for ClassicPress
 
 server.port = 80
 server.bind = "0.0.0.0"
-server.document-root = "/var/www/classicpress"
+server.document-root = "/usr/local/www/classicpress"
 server.errorlog = "/var/log/lighttpd/error.log"
-server.pid-file = "/run/lighttpd/lighttpd.pid"
-server.username = "lighttpd"
-server.groupname = "lighttpd"
+server.pid-file = "/var/run/lighttpd.pid"
+server.username = "www"
+server.groupname = "www"
 server.tag = "lighttpd"
 
 # Performance Tuning
@@ -931,13 +1120,7 @@ server.network-backend = "writev"
 server.stream-request-body = 2
 server.stream-response-body = 2
 
-# Event Handler (epoll on Linux)
-server.event-handler = "linux-sysepoll"
-
-# File Descriptor Limits
-server.max-fds = 8192
-
-# Gzip Compression (requires mod_deflate)
+# Gzip Compression
 server.modules += ( "mod_deflate" )
 deflate.cache-dir = "/var/cache/lighttpd/compress"
 deflate.mimetypes = (
@@ -984,21 +1167,18 @@ server.modules += ( "mod_rewrite", "mod_fastcgi", "mod_access" )
 
 # URL rewrite rules for WordPress/ClassicPress
 url.rewrite-if-not-file = (
-    # Don't rewrite wp-admin, wp-content, wp-includes directories
     "^/wp-admin" => "\$0",
     "^/wp-content" => "\$0",
     "^/wp-includes" => "\$0",
-    # Don't rewrite existing files
-    "^/(.*\.php)$" => "\$1",
-    # Rewrite everything else to index.php
-    "^/(.*)$" => "/index.php"
+    "^/(.*\\.php)\$" => "\$1",
+    "^/(.*)\$" => "/index.php"
 )
 
 # PHP-FPM FastCGI Configuration
 fastcgi.server = (
     ".php" => (
         "php-local" => (
-            "socket" => "/run/php-fpm/php-fpm.sock",
+            "socket" => "/var/run/php-fpm/php-fpm.sock",
             "broken-scriptfilename" => "enable",
             "allow-x-send-file" => "enable",
             "min-procs" => 1,
@@ -1007,9 +1187,7 @@ fastcgi.server = (
                 "PHP_FCGI_CHILDREN" => "0",
                 "PHP_FCGI_MAX_REQUESTS" => "1000"
             ),
-            # Fix for WordPress/ClassicPress admin panel
             "fix-root-scriptname" => "enable",
-            # Increase timeouts to prevent connection resets
             "read-timeout" => "300",
             "write-timeout" => "300",
             "connect-timeout" => "60"
@@ -1020,7 +1198,7 @@ fastcgi.server = (
 # Handle index.php properly
 index-file.names = ( "index.php", "index.html" )
 
-# Static File Caching (very aggressive)
+# Static File Caching
 server.modules += ( "mod_expire" )
 expire.url = (
     "/" => "access plus 1 months",
@@ -1036,7 +1214,7 @@ expire.url = (
     ".ttf" => "access plus 1 months"
 )
 
-# ETags (built-in to lighttpd 1.4.40+, no module needed)
+# ETags
 etag.use-inode = "disable"
 etag.use-mtime = "enable"
 etag.use-size = "enable"
@@ -1045,50 +1223,50 @@ etag.use-size = "enable"
 url.access-deny = ( "~", ".inc", ".htaccess", ".htpasswd" )
 
 # Deny access to sensitive files
-\$HTTP["url"] =~ "^/wp-config\.php$" {
+\$HTTP["url"] =~ "^/wp-config\\.php\$" {
     url.access-deny = ( "" )
 }
-
 EOF
 
 # Create necessary directories
 mkdir -p /var/cache/lighttpd/compress
 mkdir -p /var/log/lighttpd
-mkdir -p /run/lighttpd
-chown -R lighttpd:lighttpd /var/cache/lighttpd
-chown -R lighttpd:lighttpd /var/log/lighttpd
-chown -R lighttpd:lighttpd /run/lighttpd
+mkdir -p /var/run
+chown -R www:www /var/cache/lighttpd
+chown -R www:www /var/log/lighttpd
 
-# Enable Lighttpd
-rc-update add lighttpd default >> "$LOG_FILE" 2>&1
+# Enable Lighttpd in rc.conf
+sysrc lighttpd_enable="YES" >> "$LOG_FILE" 2>&1
 
-# Clean up any stale Lighttpd processes
+# Clean up and start Lighttpd
 pkill -9 lighttpd 2>/dev/null || true
 sleep 2
 
-# Start Lighttpd via service (ignore "already starting" warning)
-service lighttpd start >> "$LOG_FILE" 2>&1 || true
-sleep 5
-
-# Verify Lighttpd is actually running
-if ! pgrep -x lighttpd > /dev/null 2>&1; then
+info "Starting Lighttpd..."
+if service lighttpd start >> "$LOG_FILE" 2>&1; then
+    success "Lighttpd started"
+else
     # Try direct start as fallback
-    /usr/sbin/lighttpd -f /etc/lighttpd/lighttpd.conf >> "$LOG_FILE" 2>&1 &
-    sleep 5
+    if [ -x /usr/local/sbin/lighttpd ]; then
+        /usr/local/sbin/lighttpd -f /usr/local/etc/lighttpd/lighttpd.conf >> "$LOG_FILE" 2>&1 &
+        sleep 3
+    fi
 fi
 
 if pgrep -x lighttpd > /dev/null 2>&1; then
     success "Lighttpd configured and running"
 else
     echo "WARNING: Lighttpd may not be running properly"
+    echo "  Check: tail -f /var/log/lighttpd/error.log"
 fi
 
 # =============================================================================
 # STEP 8: Let's Encrypt SSL Setup (Optional)
 # =============================================================================
-info "Step 8/8: Checking for Let's Encrypt SSL setup..."
+info "Step 8/8: Checking for SSL setup..."
 
 SSL_ENABLED=0
+SSL_TYPE=""
 
 if [ "$SSL_MODE" = "letsencrypt" ]; then
     info "Setting up Let's Encrypt SSL for domain: $DOMAIN"
@@ -1104,12 +1282,11 @@ if [ "$SSL_MODE" = "letsencrypt" ]; then
     fi
     
     if [ -f "$ACME_SH_HOME/acme.sh" ]; then
-        # Create SSL directory
         mkdir -p "$SSL_DIR"
         
-        # Create challenge directory for ACME HTTP-01 validation
+        # Create challenge directory
         mkdir -p "${WEB_ROOT}/.well-known/acme-challenge"
-        chown -R lighttpd:lighttpd "${WEB_ROOT}/.well-known"
+        chown -R www:www "${WEB_ROOT}/.well-known"
         
         # Issue certificate
         info "Requesting SSL certificate from Let's Encrypt..."
@@ -1124,25 +1301,22 @@ if [ "$SSL_MODE" = "letsencrypt" ]; then
         if [ $? -eq 0 ]; then
             success "SSL certificate obtained for $DOMAIN"
             
-            # Install certificate files to standard location
+            # Install certificate
             "$ACME_SH_HOME/acme.sh" --install-cert -d "$DOMAIN" \
                 --key-file "${SSL_DIR}/${DOMAIN}.key" \
                 --fullchain-file "${SSL_DIR}/${DOMAIN}.pem" \
                 --reloadcmd "service lighttpd restart" \
                 >> "$LOG_FILE" 2>&1
             
-            # Create combined PEM file for Lighttpd
+            # Create combined PEM
             cat "${SSL_DIR}/${DOMAIN}.pem" "${SSL_DIR}/${DOMAIN}.key" > "${SSL_DIR}/${DOMAIN}-combined.pem"
             chmod 600 "${SSL_DIR}/${DOMAIN}"*.pem
             
             # Configure Lighttpd for SSL
             info "Configuring Lighttpd for HTTPS..."
+            cp /usr/local/etc/lighttpd/lighttpd.conf /usr/local/etc/lighttpd/lighttpd.conf.http
             
-            # Backup original config
-            cp /etc/lighttpd/lighttpd.conf /etc/lighttpd/lighttpd.conf.http
-            
-            # Create SSL configuration
-            cat >> /etc/lighttpd/lighttpd.conf << EOF
+            cat >> /usr/local/etc/lighttpd/lighttpd.conf << EOF
 
 # SSL Configuration for $DOMAIN
 server.modules += ( "mod_openssl" )
@@ -1161,43 +1335,36 @@ server.modules += ( "mod_openssl" )
 }
 EOF
             
-            # Restart Lighttpd to apply SSL config
             service lighttpd restart >> "$LOG_FILE" 2>&1
             sleep 2
             
-            # Verify SSL is working
             if pgrep -x lighttpd > /dev/null 2>&1; then
                 success "SSL configured successfully"
                 SSL_ENABLED=1
                 SSL_TYPE="letsencrypt"
             else
-                echo "WARNING: Lighttpd failed to start with SSL, restoring HTTP config"
-                cp /etc/lighttpd/lighttpd.conf.http /etc/lighttpd/lighttpd.conf
+                echo "WARNING: Lighttpd failed with SSL, restoring HTTP config"
+                cp /usr/local/etc/lighttpd/lighttpd.conf.http /usr/local/etc/lighttpd/lighttpd.conf
                 service lighttpd start >> "$LOG_FILE" 2>&1
                 SSL_ENABLED=0
             fi
             
-            # Setup auto-renewal cron job (runs twice daily as recommended by Let's Encrypt)
+            # Setup auto-renewal
             info "Setting up automated SSL certificate renewal..."
             echo "0 3,15 * * * $ACME_SH_HOME/acme.sh --cron --home \"$ACME_SH_HOME\" >> /var/log/acme-renewal.log 2>&1" | crontab -
-            success "SSL auto-renewal configured (runs at 3:00 AM and 3:00 PM daily)"
-            
+            success "SSL auto-renewal configured"
         else
             echo "WARNING: Failed to obtain SSL certificate"
-            echo "  Check the domain DNS and ensure it points to this server"
-            echo "  Logs: $LOG_FILE"
             SSL_ENABLED=0
         fi
     fi
 elif [ "$SSL_MODE" = "selfsigned" ]; then
-    # Self-signed certificate for IP address
-    info "Setting up self-signed SSL certificate for IP address..."
-    info "Note: Browsers will show a security warning (this is normal for self-signed certs)"
+    info "Setting up self-signed SSL certificate..."
     
     mkdir -p "$SSL_DIR"
     
     # Get IP address
-    SERVER_IP=$(ip addr show 2>/dev/null | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | cut -d/ -f1)
+    SERVER_IP=$(ifconfig | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}')
     if [ -z "$SERVER_IP" ]; then
         SERVER_IP=$(hostname -i 2>/dev/null | awk '{print $1}')
     fi
@@ -1208,31 +1375,23 @@ elif [ "$SSL_MODE" = "selfsigned" ]; then
     CERT_NAME="self-signed-${SERVER_IP}"
     
     # Generate self-signed certificate
-    info "Generating self-signed certificate for IP: $SERVER_IP"
-    
-    # Use a background process with timeout to avoid hanging
-    (openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout "${SSL_DIR}/${CERT_NAME}.key" \
         -out "${SSL_DIR}/${CERT_NAME}.pem" \
         -subj "/CN=${SERVER_IP}" \
-        >> "$LOG_FILE" 2>&1) &
-    OPENSSL_PID=$!
+        >> "$LOG_FILE" 2>&1
     
-    # Wait up to 30 seconds for openssl to complete
-    if wait $OPENSSL_PID; then
-        success "SSL certificate generated successfully"
+    if [ $? -eq 0 ]; then
+        success "Self-signed certificate generated"
         
-        # Create combined PEM file for Lighttpd
         cat "${SSL_DIR}/${CERT_NAME}.pem" "${SSL_DIR}/${CERT_NAME}.key" > "${SSL_DIR}/${CERT_NAME}-combined.pem"
         chmod 600 "${SSL_DIR}/${CERT_NAME}"*.pem
         
-        # Backup original config
-        cp /etc/lighttpd/lighttpd.conf /etc/lighttpd/lighttpd.conf.http
+        cp /usr/local/etc/lighttpd/lighttpd.conf /usr/local/etc/lighttpd/lighttpd.conf.http
         
-        # Create SSL configuration
-        cat >> /etc/lighttpd/lighttpd.conf << EOF
+        cat >> /usr/local/etc/lighttpd/lighttpd.conf << EOF
 
-# SSL Configuration (Self-Signed for IP: $SERVER_IP)
+# SSL Configuration (Self-Signed)
 server.modules += ( "mod_openssl" )
 
 \$SERVER["socket"] == ":443" {
@@ -1240,13 +1399,12 @@ server.modules += ( "mod_openssl" )
     ssl.pemfile = "${SSL_DIR}/${CERT_NAME}-combined.pem"
 }
 
-# HTTP to HTTPS redirect (for any host)
+# HTTP to HTTPS redirect
 \$HTTP["scheme"] == "http" {
     url.redirect = ("^/(.*)" => "https://${SERVER_IP}/\$1")
 }
 EOF
         
-        # Restart Lighttpd to apply SSL config
         service lighttpd restart >> "$LOG_FILE" 2>&1
         sleep 2
         
@@ -1254,107 +1412,19 @@ EOF
             success "Self-signed SSL configured for IP: $SERVER_IP"
             SSL_ENABLED=1
             SSL_TYPE="selfsigned"
-            DOMAIN="$SERVER_IP"  # Use IP as domain name for output
-            
-            info "Self-signed certificate valid for 365 days"
-            info "Auto-renewal configured (checks daily, renews 30 days before expiry)"
-            
-            # Create renewal script for self-signed certificate
-            RENEW_SCRIPT="/usr/local/bin/renew-selfsigned-cert.sh"
-            cat > "$RENEW_SCRIPT" << 'RENEWEOF'
-#!/bin/sh
-# Self-signed certificate renewal script
-
-SSL_DIR="/etc/ssl/acme"
-LOG_FILE="/var/log/selfsigned-renewal.log"
-
-# Get server IP
-SERVER_IP=$(ip addr show 2>/dev/null | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | cut -d/ -f1)
-if [ -z "$SERVER_IP" ]; then
-    SERVER_IP=$(hostname -i 2>/dev/null | awk '{print $1}')
-fi
-if [ -z "$SERVER_IP" ]; then
-    echo "$(date) - ERROR: Could not determine server IP" >> "$LOG_FILE"
-    exit 1
-fi
-
-CERT_NAME="self-signed-${SERVER_IP}"
-CERT_FILE="${SSL_DIR}/${CERT_NAME}.pem"
-
-# Check if certificate exists
-if [ ! -f "$CERT_FILE" ]; then
-    echo "$(date) - WARNING: Certificate file not found: $CERT_FILE" >> "$LOG_FILE"
-    exit 1
-fi
-
-# Check if certificate expires within 30 days
-EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_FILE" | cut -d= -f2)
-EXPIRY_EPOCH=$(date -d "$EXPIRY" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$EXPIRY" +%s)
-CURRENT_EPOCH=$(date +%s)
-DAYS_UNTIL_EXPIRY=$(( (EXPIRY_EPOCH - CURRENT_EPOCH) / 86400 ))
-
-echo "$(date) - Certificate expires in $DAYS_UNTIL_EXPIRY days" >> "$LOG_FILE"
-
-if [ "$DAYS_UNTIL_EXPIRY" -le 30 ]; then
-    echo "$(date) - Renewing certificate (expires in $DAYS_UNTIL_EXPIRY days)..." >> "$LOG_FILE"
-    
-    # Backup old certificate
-    BACKUP_DIR="${SSL_DIR}/backup-$(date +%Y%m%d)"
-    mkdir -p "$BACKUP_DIR"
-    cp "${SSL_DIR}/${CERT_NAME}"*.pem "$BACKUP_DIR/" 2>/dev/null
-    
-    # Generate new certificate (run in background with timeout)
-    (openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout "${SSL_DIR}/${CERT_NAME}.key" \
-        -out "${SSL_DIR}/${CERT_NAME}.pem" \
-        -subj "/CN=${SERVER_IP}" \
-        >> "$LOG_FILE" 2>&1) &
-    OPENSSL_PID=$!
-    
-    if wait $OPENSSL_PID; then
-        # Create combined PEM file
-        cat "${SSL_DIR}/${CERT_NAME}.pem" "${SSL_DIR}/${CERT_NAME}.key" > "${SSL_DIR}/${CERT_NAME}-combined.pem"
-        chmod 600 "${SSL_DIR}/${CERT_NAME}"*.pem
-        
-        # Reload Lighttpd
-        service lighttpd reload >> "$LOG_FILE" 2>&1
-        
-        echo "$(date) - Certificate renewed successfully" >> "$LOG_FILE"
-        
-        # Clean up old backups (keep last 5)
-        ls -1d "${SSL_DIR}/backup-"* 2>/dev/null | sort -r | tail -n +6 | xargs -r rm -rf
-    else
-        echo "$(date) - ERROR: Failed to renew certificate" >> "$LOG_FILE"
-        # Restore old certificate from backup
-        cp "${BACKUP_DIR}/${CERT_NAME}"*.pem "${SSL_DIR}/" 2>/dev/null
-        exit 1
-    fi
-else
-    echo "$(date) - Certificate still valid, no renewal needed" >> "$LOG_FILE"
-fi
-RENEWEOF
-            chmod +x "$RENEW_SCRIPT"
-            
-            # Setup cron job to run daily at 2:30 AM
-            info "Setting up automated self-signed certificate renewal..."
-            echo "30 2 * * * $RENEW_SCRIPT >> /var/log/selfsigned-renewal.log 2>&1" | crontab -
-            success "Self-signed auto-renewal configured (checks daily, renews 30 days before expiry)"
+            DOMAIN="$SERVER_IP"
         else
-            echo "WARNING: Lighttpd failed to start with SSL, restoring HTTP config"
-            cp /etc/lighttpd/lighttpd.conf.http /etc/lighttpd/lighttpd.conf
+            echo "WARNING: Lighttpd failed with SSL"
+            cp /usr/local/etc/lighttpd/lighttpd.conf.http /usr/local/etc/lighttpd/lighttpd.conf
             service lighttpd start >> "$LOG_FILE" 2>&1
             SSL_ENABLED=0
         fi
     else
-        echo "ERROR: Failed to generate SSL certificate (openssl command failed)"
-        echo "Check log: $LOG_FILE"
+        echo "ERROR: Failed to generate SSL certificate"
         SSL_ENABLED=0
     fi
 else
     info "SSL setup skipped (HTTP only)"
-    info "  To enable SSL, use one of:"
-    info "    ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com"
-    info "    ./quickpress.sh --ssl-self-signed"
 fi
 
 # =============================================================================
@@ -1363,7 +1433,7 @@ fi
 info "Verifying installation..."
 
 # Test PHP is working via Lighttpd
-TEST_RESPONSE=$(wget -qO- --timeout=10 http://127.0.0.1/wp-admin/install.php 2>/dev/null || echo "FAILED")
+TEST_RESPONSE=$(fetch -q -o - http://127.0.0.1/wp-admin/install.php 2>/dev/null || echo "FAILED")
 
 if echo "$TEST_RESPONSE" | grep -q "ClassicPress"; then
     success "Web server responding correctly"
@@ -1372,21 +1442,21 @@ else
 fi
 
 # Test OPcache is loaded
-if php${PHP_VERSION} -m 2>/dev/null | grep -q "Zend OPcache"; then
+if php -m 2>/dev/null | grep -q "Zend OPcache"; then
     success "OPcache enabled"
 else
     echo "WARNING: OPcache may not be enabled"
 fi
 
-# Test KeyDB connection
-if keydb-cli ping 2>/dev/null | grep -q "PONG"; then
-    success "KeyDB object cache enabled"
+# Test Redis connection
+if redis-cli ping 2>/dev/null | grep -q "PONG"; then
+    success "Redis object cache enabled"
 else
-    echo "WARNING: KeyDB may not be running"
+    echo "WARNING: Redis may not be running"
 fi
 
 # Test database connection via PHP
-php${PHP_VERSION} -r "
+php -r "
 require '${WEB_ROOT}/wp-config.php';
 \$mysqli = new mysqli(DB_HOST, DB_USER, DB_PASSWORD, DB_NAME);
 if (\$mysqli->connect_error) {
@@ -1397,24 +1467,24 @@ exit(0);
 
 success "Database connection verified"
 
-# Test upload directory is writable
-if sudo -u lighttpd touch "${WEB_ROOT}/wp-content/uploads/.test" 2>/dev/null; then
+# Test upload directory
+if su -m www -c "touch ${WEB_ROOT}/wp-content/uploads/.test" 2>/dev/null; then
     rm -f "${WEB_ROOT}/wp-content/uploads/.test"
     success "Upload directory is writable"
 else
-    echo "WARNING: Upload directory is not writable - uploads may fail"
+    echo "WARNING: Upload directory is not writable"
     echo "  Run: fix-classicpress-permissions"
 fi
 
 # =============================================================================
-# STEP 7: ClassicPress Additional Optimizations
+# Final Optimizations
 # =============================================================================
-info "Step 8/8: Applying ClassicPress optimizations..."
+info "Applying ClassicPress optimizations..."
 
-# Create system cron job to replace WP-CRON (much more efficient)
-echo "* * * * * cd ${WEB_ROOT} && php${PHP_VERSION} -q wp-cron.php >/dev/null 2>&1" | crontab - 2>/dev/null || true
+# Create system cron job to replace WP-CRON
+echo "* * * * * cd ${WEB_ROOT} && /usr/local/bin/php -q wp-cron.php >/dev/null 2>&1" | crontab - 2>/dev/null || true
 
-# Create .htaccess for browser caching (will work with Lighttpd mod_rewrite)
+# Create .htaccess for reference (Lighttpd uses its own config)
 cat > ${WEB_ROOT}/.htaccess << 'EOF'
 # Browser Caching
 <IfModule mod_expires.c>
@@ -1424,36 +1494,10 @@ cat > ${WEB_ROOT}/.htaccess << 'EOF'
     ExpiresByType image/gif "access plus 1 month"
     ExpiresByType image/png "access plus 1 month"
     ExpiresByType text/css "access plus 1 week"
-    ExpiresByType application/pdf "access plus 1 month"
-    ExpiresByType text/javascript "access plus 1 week"
     ExpiresByType application/javascript "access plus 1 week"
-    ExpiresByType application/x-javascript "access plus 1 week"
-    ExpiresByType application/x-shockwave-flash "access plus 1 month"
-    ExpiresByType image/x-icon "access plus 1 year"
+    ExpiresByType text/javascript "access plus 1 week"
     ExpiresDefault "access plus 2 days"
 </IfModule>
-
-# Gzip Compression
-<IfModule mod_deflate.c>
-    AddOutputFilterByType DEFLATE text/plain
-    AddOutputFilterByType DEFLATE text/html
-    AddOutputFilterByType DEFLATE text/xml
-    AddOutputFilterByType DEFLATE text/css
-    AddOutputFilterByType DEFLATE application/xml
-    AddOutputFilterByType DEFLATE application/xhtml+xml
-    AddOutputFilterByType DEFLATE application/rss+xml
-    AddOutputFilterByType DEFLATE application/javascript
-    AddOutputFilterByType DEFLATE application/x-javascript
-</IfModule>
-
-# Protect sensitive files
-<FilesMatch "^\.(htaccess|htpasswd|ini|log|sh)$">
-    Order allow,deny
-    Deny from all
-</FilesMatch>
-
-# Disable directory browsing
-Options -Indexes
 
 # BEGIN ClassicPress
 <IfModule mod_rewrite.c>
@@ -1467,14 +1511,14 @@ RewriteRule . /index.php [L]
 # END ClassicPress
 EOF
 
-chown lighttpd:lighttpd ${WEB_ROOT}/.htaccess
+chown www:www ${WEB_ROOT}/.htaccess
 
 success "ClassicPress optimizations applied"
 
 # =============================================================================
 # Get Server IP
 # =============================================================================
-IP=$(ip addr show 2>/dev/null | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}' | cut -d/ -f1)
+IP=$(ifconfig | grep "inet " | grep -v "127.0.0.1" | head -1 | awk '{print $2}')
 if [ -z "$IP" ]; then
     IP=$(hostname -i 2>/dev/null | awk '{print $1}')
 fi
@@ -1482,7 +1526,7 @@ if [ -z "$IP" ]; then
     IP="YOUR_SERVER_IP"
 fi
 
-# Set URL variables for credentials file
+# Set URL variables
 if [ "$SSL_ENABLED" = "1" ]; then
     SSL_URL_PREFIX="https"
     SSL_URL_HOST="${DOMAIN}"
@@ -1516,89 +1560,81 @@ Port:     3306
 
 PERFORMANCE OPTIMIZATIONS
 -------------------------
-Redis (Redis-compatible object cache):
-  Memory:             ${KEYDB_MEM_MB}MB
-  Threads:            4 (multi-threaded)
+Redis (Object Cache):
+  Memory:             ${REDIS_MEM_MB}MB
   Port:               6379
-  Persistence:        Disabled (cache-only)
   Eviction Policy:    allkeys-lru
 
 ClassicPress:
   WP_CACHE:           Enabled
-  Object Cache:       KeyDB (install Redis Object Cache plugin)
+  Object Cache:       Redis (install Redis Object Cache plugin)
   Memory Limit:       256M (admin: 512M)
-  Post Revisions:     3 (limits DB bloat)
-  Autosave Interval:  120s (less DB writes)
+  Post Revisions:     3
+  Autosave Interval:  120s
   WP-Cron:            Disabled (use system cron)
   Filesystem:         Direct
 
-Web Server:     Lighttpd (lightweight & fast)
-Event Handler:  linux-sysepoll
+Web Server:     Lighttpd
 Max Connections: 2048
 Gzip:           Enabled
 Static Cache:   1 month
 
 SSL Options:
-  Let's Encrypt: DOMAIN=example.com EMAIL=admin@example.com ./quickpress.sh
-  Self-signed:   IP_SSL=yes ./quickpress.sh (works with IP addresses)
-  No SSL:        ./quickpress.sh (HTTP only)
+  Let's Encrypt: ./quickpress-freebsd.sh --ssl-domain example.com --ssl-email admin@example.com
+  Self-signed:   ./quickpress-freebsd.sh --ssl-self-signed
+  No SSL:        ./quickpress-freebsd.sh
 
 PHP Version:    ${PHP_VERSION}
 OPcache:        Enabled (256MB)
 JIT Compiler:   Enabled (128MB)
-PHP-FPM Socket: /run/php-fpm/php-fpm.sock
-Process Manager: Dynamic (5-50 children)
-Realpath Cache: 16MB
+PHP-FPM Socket: /var/run/php-fpm/php-fpm.sock
 
-MariaDB:
+Database (MySQL/MariaDB):
   InnoDB Buffer Pool: ${INNODB_BUFFER_POOL}MB
   Query Cache: 64MB
   Connection Limit: 100
-  Table Cache: 4000
-  Log Files: /var/log/mysql/
 
 FILE LOCATIONS
 --------------
 Web Root:     ${WEB_ROOT}
 Config:       ${WEB_ROOT}/wp-config.php
-Lighttpd:     /etc/lighttpd/lighttpd.conf
-PHP Config:   /etc/php${PHP_VERSION}/conf.d/00_opcache.ini
-MariaDB:      /etc/my.cnf.d/mariadb-server.cnf
-Redis Config: /etc/keydb.conf
-Redis Data:   /var/lib/keydb
+Lighttpd:     /usr/local/etc/lighttpd/lighttpd.conf
+PHP Config:   /usr/local/etc/php/
+DB Config:    /usr/local/etc/mysql/my.cnf
+Redis Config: /usr/local/etc/redis.conf
 SSL Certs:    ${SSL_DIR}
 SSL Setup:    ${SSL_TYPE:-None}
 
 SSL SETUP OPTIONS
 -----------------
 1. Let's Encrypt (trusted certificate, requires domain):
-   ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com
+   ./quickpress-freebsd.sh --ssl-domain example.com --ssl-email admin@example.com
    Auto-renewal: 3:00 AM & 3:00 PM daily
 
 2. Self-signed (works with IP addresses, browser warning):
-   ./quickpress.sh --ssl-self-signed
-   Auto-renewal: Daily at 2:30 AM (renews 30 days before expiry)
+   ./quickpress-freebsd.sh --ssl-self-signed
 
 3. No SSL (HTTP only):
-   ./quickpress.sh
+   ./quickpress-freebsd.sh
 
 SERVICE COMMANDS
 ----------------
 Restart Lighttpd:  service lighttpd restart
-Restart PHP-FPM:   service php-fpm${PHP_VERSION} restart
-Restart MariaDB:   service mariadb restart
-Restart KeyDB:     service keydb restart
-KeyDB CLI:         keydb-cli
-KeyDB Monitor:     keydb-cli monitor
+Restart PHP-FPM:   service php-fpm restart
+Restart Database:  service mysql-server restart
+                   (or: service mariadb restart)
+Restart Redis:     service redis restart
+Redis CLI:         redis-cli
+Redis Monitor:     redis-cli monitor
 
 Check PHP Status:
   php -i | grep opcache
   php -i | grep jit
 
-Check KeyDB Status:
-  keydb-cli ping
-  keydb-cli info stats
-  keydb-cli info memory
+Check Redis Status:
+  redis-cli ping
+  redis-cli info stats
+  redis-cli info memory
 
 NEXT STEPS
 ----------
@@ -1611,15 +1647,11 @@ NEXT STEPS
    - Search: "Redis Object Cache" by Till Kruss
    - Click Install -> Activate
    - Go to Settings -> Redis -> Click "Enable Object Cache"
-   (Plugin will auto-connect to KeyDB at 127.0.0.1:6379)
 
 View Logs:
   tail -f ${LOG_FILE}
   tail -f /var/log/lighttpd/error.log
-  tail -f /var/log/keydb/keydb.log
-  tail -f /var/log/acme-renewal.log        # Let's Encrypt renewal logs
-  tail -f /var/log/selfsigned-renewal.log  # Self-signed renewal logs
-  # Enable WP_DEBUG in wp-config.php to see: ${WEB_ROOT}/wp-content/debug.log
+  tail -f /var/log/redis/redis.log
 ========================================
 EOF
 
@@ -1649,127 +1681,64 @@ if [ "$SSL_ENABLED" = "1" ]; then
     if [ "${SSL_TYPE}" = "selfsigned" ]; then
         echo "SSL/TLS Enabled (Self-Signed):"
         echo "   - IP Address:   ${DOMAIN}"
-        echo "   - Certificate:  Self-signed (browsers will show warning)"
         echo "   - Valid for:    365 days"
-        echo "   - Auto-renewal: Checks daily, renews 30 days before expiry"
         echo ""
-        echo "WARNING: Browsers will show 'Not Secure' warning. This is normal for self-signed certs."
-        echo "         Click 'Advanced' -> 'Proceed anyway' to access the site."
+        echo "WARNING: Browsers will show 'Not Secure' warning."
+        echo "         Click 'Advanced' -> 'Proceed anyway' to access."
         echo ""
     else
         echo "SSL/TLS Enabled (Let's Encrypt):"
         echo "   - Domain:       ${DOMAIN}"
-        echo "   - Certificate:  Trusted (browsers show secure lock)"
         echo "   - Auto-renewal: 3:00 AM & 3:00 PM daily"
-        echo "   - Cert path:    ${SSL_DIR}/${DOMAIN}.pem"
-        echo "   - Key path:     ${SSL_DIR}/${DOMAIN}.key"
         echo ""
     fi
 fi
 echo "Performance Optimizations Enabled:"
 echo ""
-echo "KeyDB (Redis-compatible):"
-echo "   - Object Cache: Enabled (${KEYDB_MEM_MB}MB)"
-echo "   - Multi-threaded: 4 threads"
-echo "   - Persistence: Disabled (pure cache mode)"
-echo "   - Eviction: allkeys-lru"
-echo "   - Redis Plugin: Install manually from wp-admin"
+echo "Redis (Object Cache):"
+echo "   - Memory: ${REDIS_MEM_MB}MB"
+echo "   - Port: 6379"
 echo ""
 echo "ClassicPress:"
 echo "   - WP_CACHE: Enabled"
-echo "   - KeyDB Object Cache: Install Redis Object Cache plugin"
-echo "   - Memory Limit: 256M (admin: 512M)"
-
+echo "   - Memory Limit: 256M"
 echo "   - Post Revisions: Limited to 3"
-echo "   - Autosave: Every 120s (less DB writes)"
-echo "   - WP-Cron: Disabled (use system cron)"
-echo "   - Direct Filesystem: Enabled"
-echo ""
-echo "Lighttpd:"
-echo "   - Event Handler: linux-sysepoll"
-echo "   - Max Connections: 2048"
-echo "   - Gzip Compression: Enabled"
-echo "   - Static File Caching: 1 month"
-echo "   - ETags: Enabled"
+echo "   - Autosave: Every 120s"
 echo ""
 echo "PHP:"
 echo "   - OPcache (256MB memory)"
 echo "   - JIT Compiler (128MB buffer)"
-echo "   - Unix Socket (faster than TCP)"
-echo "   - Dynamic Process Manager"
-echo "   - Realpath Cache (16MB)"
 echo ""
-echo "MariaDB:"
+echo "Database (MySQL/MariaDB):"
 echo "   - InnoDB Buffer Pool: ${INNODB_BUFFER_POOL}MB"
-echo "   - Query Cache: 64MB"
-echo "   - Connection Limit: 100"
-echo "   - Table Cache: 4000"
 echo ""
 echo "Credentials saved to: ${CREDENTIALS_FILE}"
 echo ""
 echo "Next Steps:"
 if [ "$SSL_ENABLED" = "1" ]; then
-    echo "   1. Open https://${DOMAIN}/wp-admin/install.php in your browser"
+    echo "   1. Open https://${DOMAIN}/wp-admin/install.php"
 else
-    echo "   1. Open http://${IP}/wp-admin/install.php in your browser"
+    echo "   1. Open http://${IP}/wp-admin/install.php"
 fi
 echo "   2. Complete the ClassicPress setup wizard"
-echo "   3. Configure your site title and admin user"
 echo ""
-echo "Enable Object Cache (Recommended):"
+echo "Enable Object Cache:"
 echo "   1. Go to wp-admin -> Plugins -> Add New"
 echo "   2. Search: 'Redis Object Cache' by Till Kruss"
-echo "   3. Click Install -> Activate"
-echo "   4. Go to Settings -> Redis -> Click 'Enable Object Cache'"
-echo "   (Connects automatically to KeyDB at 127.0.0.1:6379)"
+echo "   3. Install and Activate"
+echo "   4. Go to Settings -> Redis -> Enable Object Cache"
 echo ""
-echo "SSL Setup (if you want to add SSL later):"
-echo "   Let's Encrypt: ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com"
-echo "   Self-signed:   ./quickpress.sh --ssl-self-signed"
-echo ""
-echo "File Upload Troubleshooting:"
-echo "   If uploads fail with 'could not be moved' error:"
-echo "   1. Fix permissions: /usr/local/bin/fix-classicpress-permissions"
-echo "   2. Check /tmp: ls -ld /tmp (should be drwxrwxrwt)"
-echo "   3. Check uploads dir: ls -la ${WEB_ROOT}/wp-content/uploads/"
-echo "   4. PHP extensions: php83 -m | grep -E '(gd|exif|imagick)'"
-echo "   5. Upload limits: php83 -r 'echo ini_get(\"upload_max_filesize\");'"
-echo "   6. Web server errors: tail -f /var/log/lighttpd/error.log"
-echo "   7. PHP error log: tail -f /var/log/php*/error.log"
-echo ""
-echo "Enable Debug Mode (if needed):"
-echo "   Edit ${WEB_ROOT}/wp-config.php:"
-echo "     define('WP_DEBUG', true);"
-echo "     define('WP_DEBUG_LOG', true);"
-echo "   Then check: tail -f ${WEB_ROOT}/wp-content/debug.log"
-echo ""
-echo "Service Management:"
-echo "   service lighttpd restart    - Restart web server"
-echo "   service php-fpm${PHP_VERSION} restart - Restart PHP"
-echo "   service mariadb restart     - Restart database"
-echo "   service keydb restart       - Restart object cache"
+echo "Troubleshooting:"
 echo "   fix-classicpress-permissions - Fix upload/permission issues"
-if [ "$SSL_ENABLED" = "1" ]; then
+echo "   service lighttpd restart       - Restart web server"
+echo "   service php-fpm restart        - Restart PHP"
+echo "   service mysql-server restart   - Restart database"
+echo "   service redis restart          - Restart object cache"
+if [ "$SSL_ENABLED" = "1" ] && [ "${SSL_TYPE}" = "letsencrypt" ]; then
     echo ""
-    if [ "${SSL_TYPE}" = "selfsigned" ]; then
-        echo "SSL Certificate Management (Self-Signed):"
-        echo "   cat ${SSL_DIR}/self-signed-*.pem               - View certificate"
-        echo "   /usr/local/bin/renew-selfsigned-cert.sh        - Manual renewal check"
-        echo "   cat /var/log/selfsigned-renewal.log            - View renewal logs"
-        echo "   rm ${SSL_DIR}/self-signed-* && IP_SSL=yes ./quickpress.sh  - Force renew"
-    else
-        echo "SSL Certificate Management (Let's Encrypt):"
-        echo "   ~/.acme.sh/acme.sh --cron --home ~/.acme.sh    - Manual renewal"
-        echo "   ~/.acme.sh/acme.sh --renew -d ${DOMAIN}        - Renew specific domain"
-        echo "   ~/.acme.sh/acme.sh --list                      - List certificates"
-        echo "   cat /var/log/acme-renewal.log                  - View renewal logs"
-    fi
+    echo "SSL Management:"
+    echo "   ~/.acme.sh/acme.sh --cron --home ~/.acme.sh    - Manual renewal"
 fi
-echo ""
-echo "Performance Check:"
-echo "   php -i | grep opcache"
-echo "   lighttpd -V"
-echo "   keydb-cli info stats"
 echo ""
 echo "=========================================="
 

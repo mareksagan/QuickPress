@@ -8,7 +8,7 @@
 
 ## Overview
 
-**QuickPress** is an end-to-end automated installer that sets up a production-ready [ClassicPress](https://classicpress.net) (WordPress-compatible CMS) instance on Alpine Linux. It configures a high-performance LEMP-like stack optimized for VMs and small servers.
+**QuickPress** is an end-to-end automated installer that sets up a production-ready [ClassicPress](https://classicpress.net) (WordPress-compatible CMS) instance. It configures a high-performance LEMP-like stack optimized for VMs and small servers.
 
 ### What's Installed
 
@@ -16,9 +16,19 @@
 |-----------|---------|--------------|
 | **Lighttpd** | Web server | Event-driven, low memory footprint |
 | **PHP 8.3** | Application runtime | OPcache + JIT compilation |
-| **MariaDB** | Database | Tuned InnoDB buffer pool |
-| **KeyDB** | Object cache | Multi-threaded Redis-compatible |
+| **MySQL/MariaDB** | Database | Tuned InnoDB buffer pool |
+| **KeyDB/Redis** | Object cache | In-memory data structure store |
 | **ClassicPress 2.6.0** | CMS | Pre-configured for performance |
+
+### Platform Differences
+
+| Feature | Alpine Linux | FreeBSD |
+|---------|-------------|---------|
+| Package Manager | `apk` | `pkg` |
+| Init System | OpenRC | rc.d |
+| Database | MariaDB | MySQL 8.2 (MariaDB fallback) |
+| Object Cache | KeyDB | Redis |
+| Web User | `lighttpd` | `www` |
 
 ## Features
 
@@ -31,18 +41,32 @@
 
 ## Requirements
 
+### Alpine Linux
 - Alpine Linux (3.16+)
 - Root access
 - 1GB+ RAM recommended
+
+### FreeBSD
+- FreeBSD 13.x or 14.x
+- Root access
+- 1GB+ RAM recommended
+- MySQL 8.2 (default) or MariaDB 10.6 (fallback)
 - (Optional) Domain pointed to server for Let's Encrypt SSL
 
 ## Quick Start
 
+### Alpine Linux
 ```bash
-# Download and run
 wget https://raw.githubusercontent.com/yourusername/quickpress/main/quickpress.sh
 chmod +x quickpress.sh
 sudo ./quickpress.sh
+```
+
+### FreeBSD
+```bash
+fetch https://raw.githubusercontent.com/yourusername/quickpress/main/quickpress-freebsd.sh
+chmod +x quickpress-freebsd.sh
+sudo ./quickpress-freebsd.sh
 ```
 
 Then open `http://YOUR_SERVER_IP/wp-admin/install.php` to complete ClassicPress setup.
@@ -54,19 +78,28 @@ Then open `http://YOUR_SERVER_IP/wp-admin/install.php` to complete ClassicPress 
 ./quickpress.sh
 ```
 
-### Let's Encrypt SSL (requires domain)
+### Alpine Linux
 ```bash
+# Let's Encrypt SSL (requires domain)
 ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com
-```
 
-### Self-Signed SSL (works with IP addresses)
-```bash
+# Self-Signed SSL (works with IP addresses)
 ./quickpress.sh --ssl-self-signed
+
+# Show Help
+./quickpress.sh --help
 ```
 
-### Show Help
+### FreeBSD
 ```bash
-./quickpress.sh --help
+# Let's Encrypt SSL (requires domain)
+./quickpress-freebsd.sh --ssl-domain example.com --ssl-email admin@example.com
+
+# Self-Signed SSL (works with IP addresses)
+./quickpress-freebsd.sh --ssl-self-signed
+
+# Show Help
+./quickpress-freebsd.sh --help
 ```
 
 ## Performance Optimizations
@@ -110,6 +143,8 @@ Then open `http://YOUR_SERVER_IP/wp-admin/install.php` to complete ClassicPress 
 The plugin auto-connects to KeyDB at `127.0.0.1:6379`.
 
 ### Service Management
+
+**Alpine Linux:**
 ```bash
 # Restart services
 service lighttpd restart
@@ -120,7 +155,19 @@ service keydb restart
 # Check status
 keydb-cli ping           # KeyDB
 php -i | grep opcache    # OPcache
-lighttpd -V              # Lighttpd version
+```
+
+**FreeBSD:**
+```bash
+# Restart services
+service lighttpd restart
+service php-fpm restart
+service mysql-server restart
+service redis restart
+
+# Check status
+redis-cli ping           # Redis
+php -i | grep opcache    # OPcache
 ```
 
 ### Troubleshooting Uploads
@@ -131,10 +178,18 @@ fix-classicpress-permissions
 
 # Check logs
 tail -f /var/log/lighttpd/error.log
-tail -f /var/log/php83/error.log
+```
 
-# Verify extensions
+**Alpine Linux:**
+```bash
+tail -f /var/log/php83/error.log
 php83 -m | grep -E 'gd|exif|imagick'
+```
+
+**FreeBSD:**
+```bash
+tail -f /var/log/php-fpm.log
+php -m | grep -E 'gd|exif|imagick'
 ```
 
 ### SSL Certificate Management
@@ -148,16 +203,16 @@ php83 -m | grep -E 'gd|exif|imagick'
 cat /var/log/acme-renewal.log
 ```
 
-**Self-Signed:**
+**Self-Signed (FreeBSD only):**
 ```bash
-# Manual renewal check
-/usr/local/bin/renew-selfsigned-cert.sh
-
-# View renewal logs
-cat /var/log/selfsigned-renewal.log
+# Regenerate certificate
+cd /usr/local/etc/ssl/acme
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout self-signed-new.key -out self-signed-new.pem \
+  -subj "/CN=YOUR_SERVER_IP"
 ```
 
-## File Locations
+### Alpine Linux
 
 | Component | Path |
 |-----------|------|
@@ -169,6 +224,20 @@ cat /var/log/selfsigned-renewal.log
 | MariaDB Config | `/etc/my.cnf.d/mariadb-server.cnf` |
 | KeyDB Config | `/etc/keydb.conf` |
 | SSL Certificates | `/etc/ssl/acme/` |
+| Log File | `/var/log/classicpress-install.log` |
+
+### FreeBSD
+
+| Component | Path |
+|-----------|------|
+| Web Root | `/usr/local/www/classicpress` |
+| wp-config.php | `/usr/local/www/classicpress/wp-config.php` |
+| Credentials | `/root/classicpress-login.txt` |
+| Lighttpd Config | `/usr/local/etc/lighttpd/lighttpd.conf` |
+| PHP Config | `/usr/local/etc/php/` |
+| MySQL Config | `/usr/local/etc/mysql/my.cnf` |
+| Redis Config | `/usr/local/etc/redis.conf` |
+| SSL Certificates | `/usr/local/etc/ssl/acme/` |
 | Log File | `/var/log/classicpress-install.log` |
 
 ## Architecture
@@ -194,8 +263,20 @@ graph LR
 
 This project is released into the public domain via the [Unlicense](LICENSE).
 
+## Repository Structure
+
+```
+.
+├── LICENSE                   # Unlicense (public domain)
+├── README.md                 # This file
+├── quickpress.sh             # Alpine Linux installer
+└── quickpress-freebsd.sh     # FreeBSD installer
+```
+
 ## Credits
 
 - [ClassicPress](https://classicpress.net) - The CMS
-- [KeyDB](https://docs.keydb.dev/) - Multi-threaded Redis fork
+- [KeyDB](https://docs.keydb.dev/) - Multi-threaded Redis fork (Alpine)
+- [Redis](https://redis.io/) - In-memory data store (FreeBSD)
 - [Alpine Linux](https://alpinelinux.org/) - Lightweight Linux distribution
+- [FreeBSD](https://www.freebsd.org/) - Advanced Unix-like operating system
