@@ -5,15 +5,19 @@ set -e
 # ClassicPress Alpine Linux Installer - VM Edition
 # End-to-end automated installer for Alpine Linux VMs using OpenRC
 #
-# Environment Variables:
-#   DOMAIN  - Domain name for Let's Encrypt SSL (optional)
-#   EMAIL   - Email address for Let's Encrypt SSL (optional)
-#   IP_SSL  - Set to 'yes' for self-signed certificate (works with IP addresses)
+# Usage:
+#   ./quickpress.sh [OPTIONS]
 #
-# SSL Examples:
-#   Let's Encrypt (requires domain):  DOMAIN=example.com EMAIL=admin@example.com ./quickpress.sh
-#   Self-signed (works with IP):      IP_SSL=yes ./quickpress.sh
-#   No SSL (HTTP only):               ./quickpress.sh
+# SSL Options:
+#   --ssl-domain <DOMAIN>    Domain for Let's Encrypt SSL (requires --ssl-email)
+#   --ssl-email <EMAIL>      Email for Let's Encrypt SSL (requires --ssl-domain)
+#   --ssl-self-signed        Use self-signed certificate (works with IP addresses)
+#   No flags                 No SSL (HTTP only) - default
+#
+# Examples:
+#   Let's Encrypt SSL:  ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com
+#   Self-signed SSL:    ./quickpress.sh --ssl-self-signed
+#   No SSL:             ./quickpress.sh
 # =============================================================================
 
 # Configuration
@@ -25,13 +29,99 @@ PHP_VERSION="83"
 CREDENTIALS_FILE="/root/classicpress-login.txt"
 LOG_FILE="/var/log/classicpress-install.log"
 
-# SSL Configuration (optional - leave empty to skip SSL setup)
-# For Let's Encrypt: Set both DOMAIN and EMAIL (e.g., DOMAIN=example.com EMAIL=admin@example.com)
-# For self-signed IP cert: Set IP_SSL=yes (works with IP addresses, browsers will show warning)
-DOMAIN="${DOMAIN:-}"
-EMAIL="${EMAIL:-}"
-IP_SSL="${IP_SSL:-}"
+# SSL Configuration (set via command-line arguments)
+DOMAIN=""
+EMAIL=""
+SSL_MODE=""
 SSL_DIR="/etc/ssl/acme"
+
+# =============================================================================
+# Parse Command Line Arguments
+# =============================================================================
+
+show_help() {
+    cat << HELP
+ClassicPress Alpine Linux Installer - VM Edition
+
+USAGE:
+    ./quickpress.sh [OPTIONS]
+
+SSL OPTIONS:
+    --ssl-domain <DOMAIN>     Domain for Let's Encrypt SSL
+                              Requires: --ssl-email
+                              Example: --ssl-domain example.com
+
+    --ssl-email <EMAIL>       Email for Let's Encrypt SSL
+                              Required with --ssl-domain
+                              Example: --ssl-email admin@example.com
+
+    --ssl-self-signed         Use self-signed certificate
+                              Works with IP addresses
+                              Browser will show security warning
+
+OTHER OPTIONS:
+    --help, -h                Show this help message
+
+EXAMPLES:
+    Let's Encrypt (trusted SSL certificate):
+        ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com
+
+    Self-signed (works with IP, browser warning):
+        ./quickpress.sh --ssl-self-signed
+
+    No SSL (HTTP only):
+        ./quickpress.sh
+
+For more information, visit: https://github.com/ClassicPress/ClassicPress
+HELP
+}
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --ssl-domain)
+            if [ -n "$2" ] && [ "${2#--}" = "$2" ]; then
+                DOMAIN="$2"
+                SSL_MODE="letsencrypt"
+                shift 2
+            else
+                echo "ERROR: --ssl-domain requires a domain name"
+                exit 1
+            fi
+            ;;
+        --ssl-email)
+            if [ -n "$2" ] && [ "${2#--}" = "$2" ]; then
+                EMAIL="$2"
+                shift 2
+            else
+                echo "ERROR: --ssl-email requires an email address"
+                exit 1
+            fi
+            ;;
+        --ssl-self-signed)
+            SSL_MODE="selfsigned"
+            shift
+            ;;
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "ERROR: Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# Validate SSL options
+if [ "$SSL_MODE" = "letsencrypt" ]; then
+    if [ -z "$DOMAIN" ] || [ -z "$EMAIL" ]; then
+        echo "ERROR: Let's Encrypt SSL requires both --ssl-domain and --ssl-email"
+        echo "Example: ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com"
+        exit 1
+    fi
+fi
 
 # =============================================================================
 # Helper Functions
@@ -679,11 +769,11 @@ define('FS_METHOD', 'direct');
 // Disable automatic updates (for stability)
 define('AUTOMATIC_UPDATER_DISABLED', false);
 
-// Debug mode (enabled for troubleshooting)
-define('WP_DEBUG', true);
-define('WP_DEBUG_LOG', true);
+// Debug mode (disable in production)
+define('WP_DEBUG', false);
+define('WP_DEBUG_LOG', false);
 define('WP_DEBUG_DISPLAY', false);
-// Debug log location: ${WEB_ROOT}/wp-content/debug.log
+// To enable debugging, set WP_DEBUG to true and check ${WEB_ROOT}/wp-content/debug.log
 
 // Absolute path to the WordPress directory
 if (!defined('ABSPATH')) {
@@ -735,11 +825,6 @@ TEST_MONTH=$(date +%m)
 mkdir -p "${WEB_ROOT}/wp-content/uploads/${TEST_YEAR}/${TEST_MONTH}"
 chown -R lighttpd:lighttpd "${WEB_ROOT}/wp-content/uploads"
 chmod -R 775 "${WEB_ROOT}/wp-content/uploads"
-
-# Create debug.log file with proper permissions
-touch "${WEB_ROOT}/wp-content/debug.log"
-chown lighttpd:lighttpd "${WEB_ROOT}/wp-content/debug.log"
-chmod 664 "${WEB_ROOT}/wp-content/debug.log"
 
 # Verify permissions
 if [ -w "${WEB_ROOT}/wp-content/uploads" ]; then
@@ -992,7 +1077,7 @@ info "Step 8/8: Checking for Let's Encrypt SSL setup..."
 
 SSL_ENABLED=0
 
-if [ -n "$DOMAIN" ] && [ -n "$EMAIL" ]; then
+if [ "$SSL_MODE" = "letsencrypt" ]; then
     info "Setting up Let's Encrypt SSL for domain: $DOMAIN"
     
     # Install acme.sh
@@ -1047,6 +1132,8 @@ if [ -n "$DOMAIN" ] && [ -n "$EMAIL" ]; then
             cat >> /etc/lighttpd/lighttpd.conf << EOF
 
 # SSL Configuration for $DOMAIN
+server.modules += ( "mod_openssl" )
+
 \$SERVER["socket"] == ":443" {
     ssl.engine = "enable"
     ssl.pemfile = "${SSL_DIR}/${DOMAIN}-combined.pem"
@@ -1089,7 +1176,7 @@ EOF
             SSL_ENABLED=0
         fi
     fi
-elif [ "$IP_SSL" = "yes" ] || [ "$IP_SSL" = "1" ] || [ "$IP_SSL" = "true" ]; then
+elif [ "$SSL_MODE" = "selfsigned" ]; then
     # Self-signed certificate for IP address
     info "Setting up self-signed SSL certificate for IP address..."
     info "Note: Browsers will show a security warning (this is normal for self-signed certs)"
@@ -1108,24 +1195,33 @@ elif [ "$IP_SSL" = "yes" ] || [ "$IP_SSL" = "1" ] || [ "$IP_SSL" = "true" ]; the
     CERT_NAME="self-signed-${SERVER_IP}"
     
     # Generate self-signed certificate
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    info "Generating self-signed certificate for IP: $SERVER_IP"
+    
+    # Use a background process with timeout to avoid hanging
+    (openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout "${SSL_DIR}/${CERT_NAME}.key" \
         -out "${SSL_DIR}/${CERT_NAME}.pem" \
         -subj "/CN=${SERVER_IP}" \
-        -addext "subjectAltName=IP:${SERVER_IP}" \
-        >> "$LOG_FILE" 2>&1
+        >> "$LOG_FILE" 2>&1) &
+    OPENSSL_PID=$!
     
-    # Create combined PEM file for Lighttpd
-    cat "${SSL_DIR}/${CERT_NAME}.pem" "${SSL_DIR}/${CERT_NAME}.key" > "${SSL_DIR}/${CERT_NAME}-combined.pem"
-    chmod 600 "${SSL_DIR}/${CERT_NAME}"*.pem
-    
-    # Backup original config
-    cp /etc/lighttpd/lighttpd.conf /etc/lighttpd/lighttpd.conf.http
-    
-    # Create SSL configuration
-    cat >> /etc/lighttpd/lighttpd.conf << EOF
+    # Wait up to 30 seconds for openssl to complete
+    if wait $OPENSSL_PID; then
+        success "SSL certificate generated successfully"
+        
+        # Create combined PEM file for Lighttpd
+        cat "${SSL_DIR}/${CERT_NAME}.pem" "${SSL_DIR}/${CERT_NAME}.key" > "${SSL_DIR}/${CERT_NAME}-combined.pem"
+        chmod 600 "${SSL_DIR}/${CERT_NAME}"*.pem
+        
+        # Backup original config
+        cp /etc/lighttpd/lighttpd.conf /etc/lighttpd/lighttpd.conf.http
+        
+        # Create SSL configuration
+        cat >> /etc/lighttpd/lighttpd.conf << EOF
 
 # SSL Configuration (Self-Signed for IP: $SERVER_IP)
+server.modules += ( "mod_openssl" )
+
 \$SERVER["socket"] == ":443" {
     ssl.engine = "enable"
     ssl.pemfile = "${SSL_DIR}/${CERT_NAME}-combined.pem"
@@ -1136,29 +1232,23 @@ elif [ "$IP_SSL" = "yes" ] || [ "$IP_SSL" = "1" ] || [ "$IP_SSL" = "true" ]; the
     url.redirect = ("^/(.*)" => "https://${SERVER_IP}/\$1")
 }
 EOF
-    
-    # Restart Lighttpd to apply SSL config
-    service lighttpd restart >> "$LOG_FILE" 2>&1
-    sleep 2
-    
-    if pgrep -x lighttpd > /dev/null 2>&1; then
-        success "Self-signed SSL configured for IP: $SERVER_IP"
-        SSL_ENABLED=1
-        SSL_TYPE="selfsigned"
-        DOMAIN="$SERVER_IP"  # Use IP as domain name for output
-    else
-        echo "WARNING: Lighttpd failed to start with SSL, restoring HTTP config"
-        cp /etc/lighttpd/lighttpd.conf.http /etc/lighttpd/lighttpd.conf
-        service lighttpd start >> "$LOG_FILE" 2>&1
-        SSL_ENABLED=0
-    fi
-    
-    info "Self-signed certificate valid for 365 days"
-    info "Auto-renewal configured (checks daily, renews 30 days before expiry)"
-    
-    # Create renewal script for self-signed certificate
-    RENEW_SCRIPT="/usr/local/bin/renew-selfsigned-cert.sh"
-    cat > "$RENEW_SCRIPT" << 'RENEWEOF'
+        
+        # Restart Lighttpd to apply SSL config
+        service lighttpd restart >> "$LOG_FILE" 2>&1
+        sleep 2
+        
+        if pgrep -x lighttpd > /dev/null 2>&1; then
+            success "Self-signed SSL configured for IP: $SERVER_IP"
+            SSL_ENABLED=1
+            SSL_TYPE="selfsigned"
+            DOMAIN="$SERVER_IP"  # Use IP as domain name for output
+            
+            info "Self-signed certificate valid for 365 days"
+            info "Auto-renewal configured (checks daily, renews 30 days before expiry)"
+            
+            # Create renewal script for self-signed certificate
+            RENEW_SCRIPT="/usr/local/bin/renew-selfsigned-cert.sh"
+            cat > "$RENEW_SCRIPT" << 'RENEWEOF'
 #!/bin/sh
 # Self-signed certificate renewal script
 
@@ -1184,7 +1274,7 @@ if [ ! -f "$CERT_FILE" ]; then
     exit 1
 fi
 
-# Check if certificate expires within 30 days (2592000 seconds)
+# Check if certificate expires within 30 days
 EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_FILE" | cut -d= -f2)
 EXPIRY_EPOCH=$(date -d "$EXPIRY" +%s 2>/dev/null || date -j -f "%b %d %H:%M:%S %Y %Z" "$EXPIRY" +%s)
 CURRENT_EPOCH=$(date +%s)
@@ -1200,15 +1290,15 @@ if [ "$DAYS_UNTIL_EXPIRY" -le 30 ]; then
     mkdir -p "$BACKUP_DIR"
     cp "${SSL_DIR}/${CERT_NAME}"*.pem "$BACKUP_DIR/" 2>/dev/null
     
-    # Generate new certificate
-    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    # Generate new certificate (run in background with timeout)
+    (openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout "${SSL_DIR}/${CERT_NAME}.key" \
         -out "${SSL_DIR}/${CERT_NAME}.pem" \
         -subj "/CN=${SERVER_IP}" \
-        -addext "subjectAltName=IP:${SERVER_IP}" \
-        >> "$LOG_FILE" 2>&1
+        >> "$LOG_FILE" 2>&1) &
+    OPENSSL_PID=$!
     
-    if [ $? -eq 0 ]; then
+    if wait $OPENSSL_PID; then
         # Create combined PEM file
         cat "${SSL_DIR}/${CERT_NAME}.pem" "${SSL_DIR}/${CERT_NAME}.key" > "${SSL_DIR}/${CERT_NAME}-combined.pem"
         chmod 600 "${SSL_DIR}/${CERT_NAME}"*.pem
@@ -1230,17 +1320,28 @@ else
     echo "$(date) - Certificate still valid, no renewal needed" >> "$LOG_FILE"
 fi
 RENEWEOF
-    chmod +x "$RENEW_SCRIPT"
-    
-    # Setup cron job to run daily at 2:30 AM (checks if renewal is needed)
-    info "Setting up automated self-signed certificate renewal..."
-    echo "30 2 * * * $RENEW_SCRIPT >> /var/log/selfsigned-renewal.log 2>&1" | crontab -
-    success "Self-signed auto-renewal configured (checks daily, renews 30 days before expiry)"
+            chmod +x "$RENEW_SCRIPT"
+            
+            # Setup cron job to run daily at 2:30 AM
+            info "Setting up automated self-signed certificate renewal..."
+            echo "30 2 * * * $RENEW_SCRIPT >> /var/log/selfsigned-renewal.log 2>&1" | crontab -
+            success "Self-signed auto-renewal configured (checks daily, renews 30 days before expiry)"
+        else
+            echo "WARNING: Lighttpd failed to start with SSL, restoring HTTP config"
+            cp /etc/lighttpd/lighttpd.conf.http /etc/lighttpd/lighttpd.conf
+            service lighttpd start >> "$LOG_FILE" 2>&1
+            SSL_ENABLED=0
+        fi
+    else
+        echo "ERROR: Failed to generate SSL certificate (openssl command failed)"
+        echo "Check log: $LOG_FILE"
+        SSL_ENABLED=0
+    fi
 else
-    info "SSL setup skipped (set DOMAIN and EMAIL for Let's Encrypt, or IP_SSL=yes for self-signed)"
-    info "  Let's Encrypt: DOMAIN=example.com EMAIL=admin@example.com ./quickpress.sh"
-    info "  Self-signed:   IP_SSL=yes ./quickpress.sh (works with IP addresses)"
-    info "  No SSL:        ./quickpress.sh (HTTP only)"
+    info "SSL setup skipped (HTTP only)"
+    info "  To enable SSL, use one of:"
+    info "    ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com"
+    info "    ./quickpress.sh --ssl-self-signed"
 fi
 
 # =============================================================================
@@ -1458,11 +1559,11 @@ SSL Setup:    ${SSL_TYPE:-None}
 SSL SETUP OPTIONS
 -----------------
 1. Let's Encrypt (trusted certificate, requires domain):
-   DOMAIN=example.com EMAIL=admin@example.com ./quickpress.sh
+   ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com
    Auto-renewal: 3:00 AM & 3:00 PM daily
 
 2. Self-signed (works with IP addresses, browser warning):
-   IP_SSL=yes ./quickpress.sh
+   ./quickpress.sh --ssl-self-signed
    Auto-renewal: Daily at 2:30 AM (renews 30 days before expiry)
 
 3. No SSL (HTTP only):
@@ -1505,6 +1606,7 @@ View Logs:
   tail -f /var/log/keydb/keydb.log
   tail -f /var/log/acme-renewal.log        # Let's Encrypt renewal logs
   tail -f /var/log/selfsigned-renewal.log  # Self-signed renewal logs
+  # Enable WP_DEBUG in wp-config.php to see: ${WEB_ROOT}/wp-content/debug.log
 ========================================
 EOF
 
@@ -1608,6 +1710,10 @@ echo "   3. Click Install -> Activate"
 echo "   4. Go to Settings -> Redis -> Click 'Enable Object Cache'"
 echo "   (Connects automatically to KeyDB at 127.0.0.1:6379)"
 echo ""
+echo "SSL Setup (if you want to add SSL later):"
+echo "   Let's Encrypt: ./quickpress.sh --ssl-domain example.com --ssl-email admin@example.com"
+echo "   Self-signed:   ./quickpress.sh --ssl-self-signed"
+echo ""
 echo "File Upload Troubleshooting:"
 echo "   If uploads fail with 'could not be moved' error:"
 echo "   1. Fix permissions: /usr/local/bin/fix-classicpress-permissions"
@@ -1618,9 +1724,11 @@ echo "   5. Upload limits: php83 -r 'echo ini_get(\"upload_max_filesize\");'"
 echo "   6. Web server errors: tail -f /var/log/lighttpd/error.log"
 echo "   7. PHP error log: tail -f /var/log/php*/error.log"
 echo ""
-echo "Debugging (WP_DEBUG is enabled):"
-echo "   WordPress debug log: tail -f ${WEB_ROOT}/wp-content/debug.log"
-echo "   To disable: Edit ${WEB_ROOT}/wp-config.php and set WP_DEBUG to false"
+echo "Enable Debug Mode (if needed):"
+echo "   Edit ${WEB_ROOT}/wp-config.php:"
+echo "     define('WP_DEBUG', true);"
+echo "     define('WP_DEBUG_LOG', true);"
+echo "   Then check: tail -f ${WEB_ROOT}/wp-content/debug.log"
 echo ""
 echo "Service Management:"
 echo "   service lighttpd restart    - Restart web server"
