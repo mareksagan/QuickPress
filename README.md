@@ -174,19 +174,12 @@ cat /var/log/selfsigned-renewal.log
 ## Architecture
 
 ```mermaid
-flowchart LR
-    Client([Client Browser]) -->|HTTP/HTTPS| Lighttpd[Lighttpd :80/:443]
-    Lighttpd -->|Unix Socket| PHP[PHP-FPM 8.3]
-    PHP --> MariaDB[(MariaDB :3306)]
-    PHP --> KeyDB[(KeyDB :6379)]
-    PHP --> Filesystem[Filesystem Uploads]
-    
-    style Client fill:#e1f5fe
-    style Lighttpd fill:#fff3e0
-    style PHP fill:#e8f5e9
-    style MariaDB fill:#fce4ec
-    style KeyDB fill:#f3e5f5
-    style Filesystem fill:#e0f2f1
+graph LR
+    A[Client Browser] -->|HTTP/HTTPS| B[Lighttpd 80/443]
+    B -->|FastCGI| C[PHP-FPM 8.3]
+    C --> D[(MariaDB 3306)]
+    C --> E[(KeyDB 6379)]
+    C --> F[Filesystem]
 ```
 
 ## Security Features
