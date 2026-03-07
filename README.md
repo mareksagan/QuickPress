@@ -171,14 +171,6 @@ cat /var/log/selfsigned-renewal.log
 | SSL Certificates | `/etc/ssl/acme/` |
 | Log File | `/var/log/classicpress-install.log` |
 
-## Test Scripts
-
-The repository includes helper scripts for testing:
-
-- **`test-upload.sh`** - Verify upload configuration and permissions
-- **`test-upload-docker.sh`** - Docker-based upload testing
-- **`test-large-upload.php`** - Test large file upload handling
-
 ## Architecture
 
 ```
