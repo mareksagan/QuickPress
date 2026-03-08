@@ -284,28 +284,25 @@ run_with_timeout 120 pkg install -y php${PHP_VERSION}-redis >> "$LOG_FILE" 2>&1 
 echo "WARNING: PHP Redis extension not available, will try later"
 
 # Database and cache
-info "Installing database server (MySQL or MariaDB) and Redis..."
+info "Installing database server (MariaDB) and KeyDB...
 
 # First, search for available database packages
 echo "Searching for available database packages..." >> "$LOG_FILE"
 pkg search -qE '^(mysql|mariadb).*server$' >> "$LOG_FILE" 2>&1 || true
 
-# Try mysql82-server first (FreeBSD 14.x default), fallback to MariaDB and others
+# Install MariaDB (preferred over MySQL for better performance and compatibility)
 DB_INSTALLED=0
-if run_with_timeout 300 pkg install -y mysql82-server >> "$LOG_FILE" 2>&1; then
-    success "MySQL 8.2 server installed"
-    DB_INSTALLED=1
-elif run_with_timeout 300 pkg install -y mysql80-server >> "$LOG_FILE" 2>&1; then
-    success "MySQL 8.0 server installed"
-    DB_INSTALLED=1
-elif run_with_timeout 300 pkg install -y mariadb106-server >> "$LOG_FILE" 2>&1; then
+if run_with_timeout 300 pkg install -y mariadb106-server >> "$LOG_FILE" 2>&1; then
     success "MariaDB 10.6 server installed"
     DB_INSTALLED=1
 elif run_with_timeout 300 pkg install -y mariadb105-server >> "$LOG_FILE" 2>&1; then
     success "MariaDB 10.5 server installed"
     DB_INSTALLED=1
-elif run_with_timeout 300 pkg install -y mysql57-server >> "$LOG_FILE" 2>&1; then
-    success "MySQL 5.7 server installed"
+elif run_with_timeout 300 pkg install -y mysql82-server >> "$LOG_FILE" 2>&1; then
+    success "MySQL 8.2 server installed (fallback)"
+    DB_INSTALLED=1
+elif run_with_timeout 300 pkg install -y mysql80-server >> "$LOG_FILE" 2>&1; then
+    success "MySQL 8.0 server installed (fallback)"
     DB_INSTALLED=1
 fi
 
@@ -395,7 +392,7 @@ fi
 # =============================================================================
 # STEP 2: Configure and Start MySQL with Performance Optimizations
 # =============================================================================
-info "Step 2/8: Configuring MySQL with performance optimizations..."
+info "Step 2/8: Configuring MariaDB with performance optimizations..."
 
 # Create MySQL directories
 mkdir -p /var/db/mysql
@@ -410,7 +407,7 @@ if [ "$INNODB_BUFFER_POOL" -lt 128 ]; then
     INNODB_BUFFER_POOL=128
 fi
 
-# Configure MySQL for performance
+# Configure MariaDB for performance
 cat > /usr/local/etc/mysql/my.cnf << EOF
 [mysqld]
 bind-address = 127.0.0.1
@@ -433,7 +430,10 @@ innodb_read_io_threads = 4
 innodb_write_io_threads = 4
 innodb_io_capacity = 2000
 
-# Query Cache removed - not supported in MySQL 8.0
+# Query Cache (MariaDB supports this)
+query_cache_type = 1
+query_cache_size = 64M
+query_cache_limit = 2M
 
 # Connection Settings
 max_connections = 100
@@ -474,24 +474,22 @@ default-character-set = utf8mb4
 default-character-set = utf8mb4
 EOF
 
-# Enable MySQL/MariaDB in rc.conf (try different service names)
+# Enable MariaDB in rc.conf (try different service names)
+sysrc mariadb_enable="YES" >> "$LOG_FILE" 2>&1 || \
+sysrc mariadb-server_enable="YES" >> "$LOG_FILE" 2>&1 || \
 sysrc mysql_enable="YES" >> "$LOG_FILE" 2>&1 || \
-sysrc mysql82_enable="YES" >> "$LOG_FILE" 2>&1 || \
-sysrc mysqld_enable="YES" >> "$LOG_FILE" 2>&1 || \
-sysrc mariadb_enable="YES" >> "$LOG_FILE" 2>&1 || true
+sysrc mysql-server_enable="YES" >> "$LOG_FILE" 2>&1 || true
 
-# Initialize MySQL/MariaDB if needed
+# Initialize MariaDB if needed
 if [ ! -d /var/db/mysql/mysql ]; then
-    info "Initializing database data directory..."
+    info "Initializing MariaDB data directory..."
     # Try different initialization methods
-    if command -v mysql_install_db > /dev/null 2>&1; then
+    if command -v mariadb-install-db > /dev/null 2>&1; then
+        mariadb-install-db --user=mysql --basedir=/usr/local --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1
+    elif command -v mysql_install_db > /dev/null 2>&1; then
         mysql_install_db --user=mysql --basedir=/usr/local --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1
     elif command -v mysqld > /dev/null 2>&1; then
         mysqld --initialize-insecure --user=mysql --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1
-    elif command -v mariadb-install-db > /dev/null 2>&1; then
-        mariadb-install-db --user=mysql --basedir=/usr/local --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1
-    elif command -v mariadbd > /dev/null 2>&1; then
-        mariadbd --initialize-insecure --user=mysql --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1
     else
         echo "WARNING: Could not find database initialization tool"
     fi
@@ -503,50 +501,44 @@ pkill -9 mysql 2>/dev/null || true
 rm -f /var/db/mysql/*.pid /var/run/mysql/*.sock 2>/dev/null || true
 sleep 2
 
-# Start MySQL/MariaDB (try different service names)
-info "Starting database server..."
-if service mysql-server start >> "$LOG_FILE" 2>&1; then
-    success "Started via mysql-server"
-elif service mysql82-server start >> "$LOG_FILE" 2>&1; then
-    success "Started via mysql82-server"
-elif service mysql start >> "$LOG_FILE" 2>&1; then
-    success "Started via mysql"
-elif service mysqld start >> "$LOG_FILE" 2>&1; then
-    success "Started via mysqld"
+# Start MariaDB (try different service names)
+info "Starting MariaDB server..."
+if service mariadb-server start >> "$LOG_FILE" 2>&1; then
+    success "Started via mariadb-server"
 elif service mariadb start >> "$LOG_FILE" 2>&1; then
     success "Started via mariadb"
-elif service mariadb-server start >> "$LOG_FILE" 2>&1; then
-    success "Started via mariadb-server"
+elif service mysql-server start >> "$LOG_FILE" 2>&1; then
+    success "Started via mysql-server"
+elif service mysql start >> "$LOG_FILE" 2>&1; then
+    success "Started via mysql"
 else
     # Try direct start as fallback
     info "Trying direct database start..."
-    if [ -x /usr/local/libexec/mysqld ]; then
-        /usr/local/libexec/mysqld --user=mysql >> "$LOG_FILE" 2>&1 &
-    elif [ -x /usr/local/sbin/mysqld ]; then
-        /usr/local/sbin/mysqld --user=mysql >> "$LOG_FILE" 2>&1 &
-    elif [ -x /usr/local/libexec/mysql82/mysqld ]; then
-        /usr/local/libexec/mysql82/mysqld --user=mysql >> "$LOG_FILE" 2>&1 &
-    elif [ -x /usr/local/libexec/mariadbd ]; then
+    if [ -x /usr/local/libexec/mariadbd ]; then
         /usr/local/libexec/mariadbd --user=mysql >> "$LOG_FILE" 2>&1 &
     elif [ -x /usr/local/sbin/mariadbd ]; then
         /usr/local/sbin/mariadbd --user=mysql >> "$LOG_FILE" 2>&1 &
+    elif [ -x /usr/local/libexec/mysqld ]; then
+        /usr/local/libexec/mysqld --user=mysql >> "$LOG_FILE" 2>&1 &
+    elif [ -x /usr/local/sbin/mysqld ]; then
+        /usr/local/sbin/mysqld --user=mysql >> "$LOG_FILE" 2>&1 &
     fi
     sleep 5
 fi
 
-# Wait for MySQL to be ready
-info "Waiting for MySQL to start..."
+# Wait for MariaDB to be ready
+info "Waiting for MariaDB to start..."
 for i in $(seq 1 30); do
     if nc -z 127.0.0.1 3306 2>/dev/null; then
-        success "MySQL is running"
+        success "MariaDB is running"
         break
     fi
     sleep 2
 done
 
-# Check if MySQL port is open
+# Check if MariaDB port is open
 if ! nc -z 127.0.0.1 3306 2>/dev/null; then
-    error_exit "MySQL failed to start"
+    error_exit "MariaDB failed to start"
 fi
 
 # Create database and user (use detected MySQL command)
@@ -573,7 +565,7 @@ if ! $MYSQL_CLIENT $MYSQL_OPTS -e "USE ${DB_NAME};" 2>/dev/null; then
     error_exit "Failed to create database"
 fi
 
-success "MySQL configured (${INNODB_BUFFER_POOL}MB buffer pool) and database created"
+success "MariaDB configured (${INNODB_BUFFER_POOL}MB buffer pool) and database created"
 
 # =============================================================================
 # STEP 3: Configure KeyDB (Redis-compatible Object Cache)
@@ -1600,9 +1592,9 @@ OPcache:        Enabled (256MB)
 JIT Compiler:   Enabled (128MB)
 PHP-FPM Socket: /var/run/php-fpm/php-fpm.sock
 
-Database (MySQL/MariaDB):
+Database (MariaDB):
   InnoDB Buffer Pool: ${INNODB_BUFFER_POOL}MB
-  Query Cache: Removed (MySQL 8.0+)
+  Query Cache: 64MB (MariaDB feature)
   Connection Limit: 100
 
 FILE LOCATIONS
@@ -1721,7 +1713,7 @@ echo "PHP:"
 echo "   - OPcache (256MB memory)"
 echo "   - JIT Compiler (128MB buffer)"
 echo ""
-echo "Database (MySQL/MariaDB):"
+echo "Database (MariaDB):"
 echo "   - InnoDB Buffer Pool: ${INNODB_BUFFER_POOL}MB"
 echo ""
 echo "Credentials saved to: ${CREDENTIALS_FILE}"
@@ -1744,7 +1736,7 @@ echo "Troubleshooting:"
 echo "   fix-classicpress-permissions - Fix upload/permission issues"
 echo "   service lighttpd restart       - Restart web server"
 echo "   service php-fpm restart        - Restart PHP"
-echo "   service mysql-server restart   - Restart database"
+echo "   service mariadb restart        - Restart database"
 echo "   service keydb restart          - Restart object cache (KeyDB)"
 echo "   service redis restart          - Restart object cache (Redis fallback)"
 if [ "$SSL_ENABLED" = "1" ] && [ "${SSL_TYPE}" = "letsencrypt" ]; then
