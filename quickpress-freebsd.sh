@@ -267,6 +267,7 @@ run_with_timeout 600 pkg install -y \
     php${PHP_VERSION}-phar \
     php${PHP_VERSION}-session \
     php${PHP_VERSION}-simplexml \
+    php${PHP_VERSION}-ctype \
     php${PHP_VERSION}-tokenizer \
     php${PHP_VERSION}-xml \
     php${PHP_VERSION}-xmlreader \
@@ -314,10 +315,11 @@ if [ "$DB_INSTALLED" -eq 0 ]; then
     pkg search -qE '^(mysql|mariadb).*server$' 2>/dev/null || echo "  (search failed)"
 fi
 
-# Install Redis
-info "Installing Redis..."
-run_with_timeout 120 pkg install -y redis >> "$LOG_FILE" 2>&1 || {
-    echo "WARNING: Redis installation may have issues, continuing..."
+# Install KeyDB (Redis-compatible, multi-threaded)
+info "Installing KeyDB (Redis-compatible)..."
+run_with_timeout 120 pkg install -y keydb >> "$LOG_FILE" 2>&1 || {
+    echo "WARNING: KeyDB installation may have issues, falling back to Redis..."
+    run_with_timeout 120 pkg install -y redis >> "$LOG_FILE" 2>&1
 }
 
 # Verify critical packages
@@ -574,9 +576,9 @@ fi
 success "MySQL configured (${INNODB_BUFFER_POOL}MB buffer pool) and database created"
 
 # =============================================================================
-# STEP 3: Configure Redis (Object Cache)
+# STEP 3: Configure KeyDB (Redis-compatible Object Cache)
 # =============================================================================
-info "Step 3/8: Configuring Redis (object cache)..."
+info "Step 3/8: Configuring KeyDB (object cache)..."
 
 # Calculate Redis memory (use 10% of total RAM for object caching)
 REDIS_MEM_MB=$((TOTAL_MEM_MB * 10 / 100))
@@ -584,9 +586,9 @@ if [ "$REDIS_MEM_MB" -lt 64 ]; then
     REDIS_MEM_MB=64
 fi
 
-# Create Redis configuration
-cat > /usr/local/etc/redis.conf << EOF
-# Redis Configuration - High Performance Mode
+# Create KeyDB configuration
+cat > /usr/local/etc/keydb.conf << EOF
+# KeyDB Configuration - High Performance Mode (Redis-compatible)
 bind 127.0.0.1
 port 6379
 tcp-backlog 511
@@ -642,7 +644,7 @@ databases 16
 
 # Logging
 loglevel notice
-logfile /var/log/redis/redis.log
+logfile /var/log/keydb/keydb.log
 EOF
 
 # Create Redis directories
@@ -662,31 +664,41 @@ chmod 644 /var/log/redis/redis.log
 # Enable Redis in rc.conf
 sysrc redis_enable="YES" >> "$LOG_FILE" 2>&1 || true
 
-# Start Redis
-pkill -9 redis-server 2>/dev/null || true
-rm -f /var/run/redis/redis.pid 2>/dev/null || true
+# Start KeyDB (or fallback to Redis)
+pkill -9 keydb-server 2>/dev/null || pkill -9 redis-server 2>/dev/null || true
+rm -f /var/run/keydb/keydb.pid /var/run/redis/redis.pid 2>/dev/null || true
 sleep 2
 
-info "Starting Redis service..."
-service redis start >> "$LOG_FILE" 2>&1 || \
-service redis-server start >> "$LOG_FILE" 2>&1 || \
-/usr/local/bin/redis-server /usr/local/etc/redis.conf --daemonize yes >> "$LOG_FILE" 2>&1 &
+if command -v keydb-server > /dev/null 2>&1; then
+    info "Starting KeyDB service..."
+    service keydb start >> "$LOG_FILE" 2>&1 || \
+    /usr/local/bin/keydb-server /usr/local/etc/keydb.conf --daemonize yes >> "$LOG_FILE" 2>&1 &
+else
+    info "Starting Redis service..."
+    service redis start >> "$LOG_FILE" 2>&1 || \
+    service redis-server start >> "$LOG_FILE" 2>&1 || \
+    /usr/local/bin/redis-server /usr/local/etc/redis.conf --daemonize yes >> "$LOG_FILE" 2>&1 &
+fi
 sleep 2
 
-# Wait for Redis to be ready
-info "Waiting for Redis to start..."
-REDIS_READY=0
+# Wait for KeyDB/Redis to be ready
+info "Waiting for object cache to start..."
+CACHE_READY=0
 for i in $(seq 1 30); do
-    if redis-cli ping 2>/dev/null | grep -q "PONG"; then
+    if keydb-cli ping 2>/dev/null | grep -q "PONG"; then
+        success "KeyDB running (${REDIS_MEM_MB}MB memory limit, multi-threaded)"
+        CACHE_READY=1
+        break
+    elif redis-cli ping 2>/dev/null | grep -q "PONG"; then
         success "Redis running (${REDIS_MEM_MB}MB memory limit)"
-        REDIS_READY=1
+        CACHE_READY=1
         break
     fi
     sleep 1
 done
 
-if [ "$REDIS_READY" -eq 0 ]; then
-    echo "WARNING: Redis may not be running properly"
+if [ "$CACHE_READY" -eq 0 ]; then
+    echo "WARNING: Object cache may not be running properly"
 fi
 
 # =============================================================================
@@ -1161,11 +1173,11 @@ setenv.add-response-header = (
 # URL Rewriting for ClassicPress/WordPress
 server.modules += ( "mod_rewrite", "mod_fastcgi", "mod_access" )
 
-# URL rewrite rules for WordPress/ClassicPress
+# URL rewrite rules for WordPress/ClassicPress - FIXED for /wp-admin/ compatibility
 url.rewrite-if-not-file = (
-    "^/wp-admin" => "\$0",
-    "^/wp-content" => "\$0",
-    "^/wp-includes" => "\$0",
+    "^/wp-admin(/.*)?" => "\$0",
+    "^/wp-content(/.*)?" => "\$0",
+    "^/wp-includes(/.*)?" => "\$0",
     "^/(.*\\.php)\$" => "\$1",
     "^/(.*)\$" => "/index.php"
 )
@@ -1444,11 +1456,13 @@ else
     echo "WARNING: OPcache may not be enabled"
 fi
 
-# Test Redis connection
-if redis-cli ping 2>/dev/null | grep -q "PONG"; then
+# Test object cache connection (KeyDB or Redis)
+if keydb-cli ping 2>/dev/null | grep -q "PONG"; then
+    success "KeyDB object cache enabled (multi-threaded)"
+elif redis-cli ping 2>/dev/null | grep -q "PONG"; then
     success "Redis object cache enabled"
 else
-    echo "WARNING: Redis may not be running"
+    echo "WARNING: Object cache may not be running"
 fi
 
 # Test database connection via PHP
@@ -1556,14 +1570,15 @@ Port:     3306
 
 PERFORMANCE OPTIMIZATIONS
 -------------------------
-Redis (Object Cache):
+KeyDB (Redis-compatible Object Cache):
   Memory:             ${REDIS_MEM_MB}MB
+  Threads:            4 (multi-threaded)
   Port:               6379
   Eviction Policy:    allkeys-lru
 
 ClassicPress:
   WP_CACHE:           Enabled
-  Object Cache:       Redis (install Redis Object Cache plugin)
+  Object Cache:       KeyDB (install Redis Object Cache plugin)
   Memory Limit:       256M (admin: 512M)
   Post Revisions:     3
   Autosave Interval:  120s
@@ -1587,7 +1602,7 @@ PHP-FPM Socket: /var/run/php-fpm/php-fpm.sock
 
 Database (MySQL/MariaDB):
   InnoDB Buffer Pool: ${INNODB_BUFFER_POOL}MB
-  Query Cache: 64MB
+  Query Cache: Removed (MySQL 8.0+)
   Connection Limit: 100
 
 FILE LOCATIONS
@@ -1597,7 +1612,7 @@ Config:       ${WEB_ROOT}/wp-config.php
 Lighttpd:     /usr/local/etc/lighttpd/lighttpd.conf
 PHP Config:   /usr/local/etc/php/
 DB Config:    /usr/local/etc/mysql/my.cnf
-Redis Config: /usr/local/etc/redis.conf
+KeyDB Config: /usr/local/etc/keydb.conf (or /usr/local/etc/redis.conf)
 SSL Certs:    ${SSL_DIR}
 SSL Setup:    ${SSL_TYPE:-None}
 
@@ -1619,7 +1634,7 @@ Restart Lighttpd:  service lighttpd restart
 Restart PHP-FPM:   service php-fpm restart
 Restart Database:  service mysql-server restart
                    (or: service mariadb restart)
-Restart Redis:     service redis restart
+Restart KeyDB:     service keydb restart (or service redis restart)
 Redis CLI:         redis-cli
 Redis Monitor:     redis-cli monitor
 
@@ -1691,8 +1706,9 @@ if [ "$SSL_ENABLED" = "1" ]; then
 fi
 echo "Performance Optimizations Enabled:"
 echo ""
-echo "Redis (Object Cache):"
+echo "KeyDB (Redis-compatible Object Cache):"
 echo "   - Memory: ${REDIS_MEM_MB}MB"
+echo "   - Threads: 4 (multi-threaded)"
 echo "   - Port: 6379"
 echo ""
 echo "ClassicPress:"
@@ -1729,7 +1745,8 @@ echo "   fix-classicpress-permissions - Fix upload/permission issues"
 echo "   service lighttpd restart       - Restart web server"
 echo "   service php-fpm restart        - Restart PHP"
 echo "   service mysql-server restart   - Restart database"
-echo "   service redis restart          - Restart object cache"
+echo "   service keydb restart          - Restart object cache (KeyDB)"
+echo "   service redis restart          - Restart object cache (Redis fallback)"
 if [ "$SSL_ENABLED" = "1" ] && [ "${SSL_TYPE}" = "letsencrypt" ]; then
     echo ""
     echo "SSL Management:"

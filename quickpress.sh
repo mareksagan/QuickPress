@@ -982,12 +982,12 @@ setenv.add-response-header = (
 # URL Rewriting for ClassicPress/WordPress
 server.modules += ( "mod_rewrite", "mod_fastcgi", "mod_access" )
 
-# URL rewrite rules for WordPress/ClassicPress
+# URL rewrite rules for WordPress/ClassicPress - FIXED for /wp-admin/ compatibility
 url.rewrite-if-not-file = (
-    # Don't rewrite wp-admin, wp-content, wp-includes directories
-    "^/wp-admin" => "\$0",
-    "^/wp-content" => "\$0",
-    "^/wp-includes" => "\$0",
+    # Don't rewrite wp-admin, wp-content, wp-includes directories (and their contents)
+    "^/wp-admin(/.*)?" => "\$0",
+    "^/wp-content(/.*)?" => "\$0",
+    "^/wp-includes(/.*)?" => "\$0",
     # Don't rewrite existing files
     "^/(.*\.php)$" => "\$1",
     # Rewrite everything else to index.php
