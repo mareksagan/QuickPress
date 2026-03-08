@@ -695,39 +695,74 @@ loglevel notice
 logfile /var/log/keydb/keydb.log
 EOF
 
-# Create Redis directories
+# Create KeyDB/Redis directories
+mkdir -p /var/db/keydb
+mkdir -p /var/log/keydb
+mkdir -p /var/run/keydb
 mkdir -p /var/db/redis
 mkdir -p /var/log/redis
 mkdir -p /var/run/redis
+
+# Fix permissions - use keydb user if exists, else redis, else root
+if id keydb > /dev/null 2>&1; then
+    KEYDB_USER="keydb"
+elif id redis > /dev/null 2>&1; then
+    KEYDB_USER="redis"
+else
+    KEYDB_USER="root"
+fi
+
+chown $KEYDB_USER:$KEYDB_USER /var/db/keydb 2>/dev/null || chown root:wheel /var/db/keydb
+chown $KEYDB_USER:$KEYDB_USER /var/log/keydb 2>/dev/null || chown root:wheel /var/log/keydb
+chown $KEYDB_USER:$KEYDB_USER /var/run/keydb 2>/dev/null || chown root:wheel /var/run/keydb
+chmod 755 /var/db/keydb
+chmod 755 /var/log/keydb
+chmod 755 /var/run/keydb
+
+# Also set up Redis directories (for fallback)
 chown redis:redis /var/db/redis 2>/dev/null || chown root:wheel /var/db/redis
 chown redis:redis /var/log/redis 2>/dev/null || chown root:wheel /var/log/redis
 chmod 755 /var/db/redis
 chmod 755 /var/log/redis
 
-# Create log file with proper permissions
+# Create log files with proper permissions
+touch /var/log/keydb/keydb.log
+chown $KEYDB_USER:$KEYDB_USER /var/log/keydb/keydb.log 2>/dev/null || chown root:wheel /var/log/keydb/keydb.log
+chmod 644 /var/log/keydb/keydb.log
+
 touch /var/log/redis/redis.log
 chown redis:redis /var/log/redis/redis.log 2>/dev/null || chown root:wheel /var/log/redis/redis.log
 chmod 644 /var/log/redis/redis.log
 
-# Enable Redis in rc.conf
+# Enable in rc.conf
+sysrc keydb_enable="YES" >> "$LOG_FILE" 2>&1 || true
 sysrc redis_enable="YES" >> "$LOG_FILE" 2>&1 || true
 
 # Start KeyDB (or fallback to Redis)
 pkill -9 keydb-server 2>/dev/null || pkill -9 redis-server 2>/dev/null || true
 rm -f /var/run/keydb/keydb.pid /var/run/redis/redis.pid 2>/dev/null || true
-sleep 2
+sleep 1
 
 if command -v keydb-server > /dev/null 2>&1; then
-    info "Starting KeyDB service..."
-    service keydb start >> "$LOG_FILE" 2>&1 || \
-    /usr/local/bin/keydb-server /usr/local/etc/keydb.conf --daemonize yes >> "$LOG_FILE" 2>&1 &
+    info "Starting KeyDB..."
+    # Try service with timeout
+    timeout 10 service keydb start >> "$LOG_FILE" 2>&1 || true
+    sleep 2
+    if ! pgrep -x keydb-server > /dev/null 2>&1; then
+        info "Using direct start..."
+        ( /usr/local/bin/keydb-server /usr/local/etc/keydb.conf >> "$LOG_FILE" 2>&1 & )
+        sleep 3
+    fi
 else
-    info "Starting Redis service..."
-    service redis start >> "$LOG_FILE" 2>&1 || \
-    service redis-server start >> "$LOG_FILE" 2>&1 || \
-    /usr/local/bin/redis-server /usr/local/etc/redis.conf --daemonize yes >> "$LOG_FILE" 2>&1 &
+    info "Starting Redis..."
+    timeout 10 service redis start >> "$LOG_FILE" 2>&1 || \
+    timeout 10 service redis-server start >> "$LOG_FILE" 2>&1 || true
+    sleep 2
+    if ! pgrep -x redis-server > /dev/null 2>&1; then
+        ( /usr/local/bin/redis-server /usr/local/etc/redis.conf >> "$LOG_FILE" 2>&1 & )
+        sleep 3
+    fi
 fi
-sleep 2
 
 # Wait for KeyDB/Redis to be ready
 info "Waiting for object cache to start..."
