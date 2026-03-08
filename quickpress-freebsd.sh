@@ -431,10 +431,7 @@ innodb_read_io_threads = 4
 innodb_write_io_threads = 4
 innodb_io_capacity = 2000
 
-# Query Cache
-query_cache_type = 1
-query_cache_size = 64M
-query_cache_limit = 2M
+# Query Cache removed - not supported in MySQL 8.0
 
 # Connection Settings
 max_connections = 100
@@ -651,31 +648,30 @@ EOF
 # Create Redis directories
 mkdir -p /var/db/redis
 mkdir -p /var/log/redis
-chown redis:redis /var/db/redis 2>/dev/null || chown root:wheel /var/db/redis
-chown redis:redis /var/log/redis 2>/dev/null || chown root:wheel /var/log/redis
-chmod 755 /var/db/redis
-chmod 755 /var/log/redis
-
-# Enable Redis in rc.conf
-sysrc redis_enable="YES" >> "$LOG_FILE" 2>&1 || true
-
-# Create Redis directories
-mkdir -p /var/db/redis
-mkdir -p /var/log/redis
 mkdir -p /var/run/redis
 chown redis:redis /var/db/redis 2>/dev/null || chown root:wheel /var/db/redis
 chown redis:redis /var/log/redis 2>/dev/null || chown root:wheel /var/log/redis
 chmod 755 /var/db/redis
 chmod 755 /var/log/redis
 
+# Create log file with proper permissions
+touch /var/log/redis/redis.log
+chown redis:redis /var/log/redis/redis.log 2>/dev/null || chown root:root /var/log/redis/redis.log
+chmod 644 /var/log/redis/redis.log
+
+# Enable Redis in rc.conf
+sysrc redis_enable="YES" >> "$LOG_FILE" 2>&1 || true
+
 # Start Redis
 pkill -9 redis-server 2>/dev/null || true
 rm -f /var/run/redis/redis.pid 2>/dev/null || true
 sleep 2
 
+info "Starting Redis service..."
 service redis start >> "$LOG_FILE" 2>&1 || \
 service redis-server start >> "$LOG_FILE" 2>&1 || \
-/usr/local/bin/redis-server /usr/local/etc/redis.conf >> "$LOG_FILE" 2>&1 &
+/usr/local/bin/redis-server /usr/local/etc/redis.conf --daemonize yes >> "$LOG_FILE" 2>&1 &
+sleep 2
 
 # Wait for Redis to be ready
 info "Waiting for Redis to start..."
