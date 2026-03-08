@@ -171,7 +171,10 @@ wait_for_port() {
     local attempt=1
     
     while [ $attempt -le $max_attempts ]; do
-        if nc -z 127.0.0.1 "$port" 2>/dev/null; then
+        # Try sockstat first (FreeBSD native), then nc
+        if sockstat -4 -l -p "$port" 2>/dev/null | grep -q ":$port"; then
+            return 0
+        elif nc -z 127.0.0.1 "$port" 2>/dev/null; then
             return 0
         fi
         sleep 1
@@ -284,32 +287,32 @@ run_with_timeout 120 pkg install -y php${PHP_VERSION}-redis >> "$LOG_FILE" 2>&1 
 echo "WARNING: PHP Redis extension not available, will try later"
 
 # Database and cache
-info "Installing database server (MariaDB) and KeyDB...
+info "Installing database server (MariaDB) and KeyDB..."
 
 # First, search for available database packages
 echo "Searching for available database packages..." >> "$LOG_FILE"
-pkg search -qE '^(mysql|mariadb).*server$' >> "$LOG_FILE" 2>&1 || true
+pkg search -qE '^mariadb.*server$' >> "$LOG_FILE" 2>&1 || pkg search -qE '^mysql.*server$' >> "$LOG_FILE" 2>&1 || true
 
 # Install MariaDB (preferred over MySQL for better performance and compatibility)
+# First ensure pcre2 is up to date to avoid library compatibility issues
+info "Ensuring library compatibility..."
+run_with_timeout 120 pkg upgrade -y pcre2 >> "$LOG_FILE" 2>&1 || true
+
 DB_INSTALLED=0
-if run_with_timeout 300 pkg install -y mariadb106-server >> "$LOG_FILE" 2>&1; then
-    success "MariaDB 10.6 server installed"
-    DB_INSTALLED=1
-elif run_with_timeout 300 pkg install -y mariadb105-server >> "$LOG_FILE" 2>&1; then
-    success "MariaDB 10.5 server installed"
-    DB_INSTALLED=1
-elif run_with_timeout 300 pkg install -y mysql82-server >> "$LOG_FILE" 2>&1; then
-    success "MySQL 8.2 server installed (fallback)"
-    DB_INSTALLED=1
-elif run_with_timeout 300 pkg install -y mysql80-server >> "$LOG_FILE" 2>&1; then
-    success "MySQL 8.0 server installed (fallback)"
-    DB_INSTALLED=1
-fi
+# Try newer MariaDB versions first (11.4 is current LTS, then 10.11, 10.6, 10.5)
+for db_pkg in mariadb114-server mariadb1011-server mariadb106-server mariadb105-server; do
+    info "Trying to install $db_pkg..."
+    if run_with_timeout 300 pkg install -y "$db_pkg" >> "$LOG_FILE" 2>&1; then
+        success "$db_pkg installed"
+        DB_INSTALLED=1
+        break
+    fi
+done
 
 if [ "$DB_INSTALLED" -eq 0 ]; then
     echo "ERROR: Could not install any MySQL/MariaDB server package"
     echo "Available packages:"
-    pkg search -qE '^(mysql|mariadb).*server$' 2>/dev/null || echo "  (search failed)"
+    pkg search -qE '^mariadb.*server$' 2>/dev/null || pkg search -qE '^mysql.*server$' 2>/dev/null || echo "  search failed"
 fi
 
 # Install KeyDB (Redis-compatible, multi-threaded)
@@ -318,6 +321,10 @@ run_with_timeout 120 pkg install -y keydb >> "$LOG_FILE" 2>&1 || {
     echo "WARNING: KeyDB installation may have issues, falling back to Redis..."
     run_with_timeout 120 pkg install -y redis >> "$LOG_FILE" 2>&1
 }
+
+# Update PCRE2 to fix library compatibility issues with MariaDB
+info "Updating PCRE2 library for MariaDB compatibility..."
+run_with_timeout 120 pkg upgrade -y pcre2 >> "$LOG_FILE" 2>&1 || true
 
 # Verify critical packages
 info "Verifying installations..."
@@ -394,6 +401,17 @@ fi
 # =============================================================================
 info "Step 2/8: Configuring MariaDB with performance optimizations..."
 
+# Fix PCRE2 library compatibility issue with MariaDB
+info "Ensuring PCRE2 library compatibility..."
+# Force reinstall/upgrade pcre2 to ensure correct version
+pkg upgrade -f -y pcre2 >> "$LOG_FILE" 2>&1 || pkg install -f -y pcre2 >> "$LOG_FILE" 2>&1 || {
+    echo "WARNING: Could not upgrade PCRE2, MariaDB may have issues"
+}
+# Also ensure libpcre2 is properly linked
+if [ -f /usr/local/lib/libpcre2-8.so.0 ]; then
+    ldconfig 2>/dev/null || true
+fi
+
 # Create MySQL directories
 mkdir -p /var/db/mysql
 mkdir -p /var/run/mysql
@@ -407,138 +425,176 @@ if [ "$INNODB_BUFFER_POOL" -lt 128 ]; then
     INNODB_BUFFER_POOL=128
 fi
 
-# Configure MariaDB for performance
-cat > /usr/local/etc/mysql/my.cnf << EOF
+# Configure MariaDB - use minimal config to avoid issues
+mkdir -p /usr/local/etc/mysql
+
+cat > /usr/local/etc/mysql/my.cnf << 'EOF'
 [mysqld]
 bind-address = 127.0.0.1
 port = 3306
-skip-networking = 0
-
-# Character set
+socket = /var/run/mysql/mysql.sock
 character-set-server = utf8mb4
 collation-server = utf8mb4_unicode_ci
-
-# InnoDB Performance
-innodb_buffer_pool_size = ${INNODB_BUFFER_POOL}M
-innodb_buffer_pool_instances = 4
-innodb_log_file_size = 128M
-innodb_log_buffer_size = 16M
-innodb_flush_log_at_trx_commit = 2
-innodb_flush_method = O_DIRECT
-innodb_file_per_table = 1
-innodb_read_io_threads = 4
-innodb_write_io_threads = 4
-innodb_io_capacity = 2000
-
-# Query Cache (MariaDB supports this)
-query_cache_type = 1
-query_cache_size = 64M
-query_cache_limit = 2M
-
-# Connection Settings
+innodb_buffer_pool_size = 128M
 max_connections = 100
-max_user_connections = 90
-wait_timeout = 300
-interactive_timeout = 300
-connect_timeout = 10
-
-# Thread Settings
-thread_cache_size = 16
-
-# Table Settings
-table_open_cache = 4000
-table_definition_cache = 2000
-tmp_table_size = 64M
-max_heap_table_size = 64M
-
-# Sort and Join Buffers
-sort_buffer_size = 2M
-read_buffer_size = 1M
-read_rnd_buffer_size = 1M
-join_buffer_size = 1M
-
-# Logging (minimal for performance)
-slow_query_log = 1
-slow_query_log_file = /var/db/mysql/slow.log
-long_query_time = 2
+skip-name-resolve
 log_error = /var/db/mysql/error.log
 
-# Disable unwanted features
-skip-name-resolve
-skip-external-locking
-
-[mysql]
-default-character-set = utf8mb4
-
 [client]
+socket = /var/run/mysql/mysql.sock
 default-character-set = utf8mb4
 EOF
 
 # Enable MariaDB in rc.conf (try different service names)
-sysrc mariadb_enable="YES" >> "$LOG_FILE" 2>&1 || \
-sysrc mariadb-server_enable="YES" >> "$LOG_FILE" 2>&1 || \
-sysrc mysql_enable="YES" >> "$LOG_FILE" 2>&1 || \
-sysrc mysql-server_enable="YES" >> "$LOG_FILE" 2>&1 || true
+# First detect which service script exists
+# Note: MariaDB 11.4+ uses 'mysql-server' rc.d script
+MYSQL_SERVICE=""
+if [ -x /usr/local/etc/rc.d/mysql-server ]; then
+    MYSQL_SERVICE="mysql-server"
+elif [ -x /usr/local/etc/rc.d/mariadb ]; then
+    MYSQL_SERVICE="mariadb"
+elif [ -x /usr/local/etc/rc.d/mysql ]; then
+    MYSQL_SERVICE="mysql"
+elif [ -x /usr/local/etc/rc.d/mariadb-server ]; then
+    MYSQL_SERVICE="mariadb-server"
+fi
 
-# Initialize MariaDB if needed
-if [ ! -d /var/db/mysql/mysql ]; then
+# Clean up rc.conf - remove all mysql entries first
+info "Configuring rc.conf..."
+for var in mariadb_enable mariadb-server_enable mysql_enable mysql-server_enable; do
+    sysrc -x "$var" 2>/dev/null || true
+done
+# Set only one
+sysrc mysql-server_enable="YES" >> "$LOG_FILE" 2>&1
+
+# Initialize MariaDB if needed (check for mysql system database)
+if [ ! -d /var/db/mysql/mysql ] || [ ! -f /var/db/mysql/ibdata1 ]; then
     info "Initializing MariaDB data directory..."
+    
+    # If directory exists but is incomplete/corrupted, back it up and start fresh
+    if [ -d /var/db/mysql ]; then
+        if ls /var/db/mysql/* > /dev/null 2>&1; then
+            info "Backing up existing incomplete MySQL data directory..."
+            mv /var/db/mysql /var/db/mysql.bak.$(date +%s)
+        fi
+    fi
+    
+    # Ensure proper ownership
+    mkdir -p /var/db/mysql
+    chown -R mysql:mysql /var/db/mysql
+    chmod 755 /var/db/mysql
+    
     # Try different initialization methods
+    INIT_SUCCESS=0
     if command -v mariadb-install-db > /dev/null 2>&1; then
-        mariadb-install-db --user=mysql --basedir=/usr/local --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1
+        info "Using mariadb-install-db to initialize..."
+        if mariadb-install-db --user=mysql --basedir=/usr/local --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1; then
+            INIT_SUCCESS=1
+        else
+            # Check for PCRE2 library error and try to fix
+            if grep -q "PCRE2" "$LOG_FILE" 2>/dev/null; then
+                info "Fixing PCRE2 library issue..."
+                pkg upgrade -f -y pcre2 >> "$LOG_FILE" 2>&1 || pkg install -y pcre2 >> "$LOG_FILE" 2>&1 || true
+                # Retry initialization
+                mariadb-install-db --user=mysql --basedir=/usr/local --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1 && INIT_SUCCESS=1 || true
+            fi
+        fi
     elif command -v mysql_install_db > /dev/null 2>&1; then
-        mysql_install_db --user=mysql --basedir=/usr/local --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1
+        info "Using mysql_install_db to initialize..."
+        mysql_install_db --user=mysql --basedir=/usr/local --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1 && INIT_SUCCESS=1 || true
     elif command -v mysqld > /dev/null 2>&1; then
-        mysqld --initialize-insecure --user=mysql --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1
+        info "Using mysqld --initialize to initialize..."
+        mysqld --initialize-insecure --user=mysql --datadir=/var/db/mysql >> "$LOG_FILE" 2>&1 && INIT_SUCCESS=1 || true
     else
         echo "WARNING: Could not find database initialization tool"
     fi
-fi
-
-# Clean up any stale state
-pkill -9 mysqld 2>/dev/null || true
-pkill -9 mysql 2>/dev/null || true
-rm -f /var/db/mysql/*.pid /var/run/mysql/*.sock 2>/dev/null || true
-sleep 2
-
-# Start MariaDB (try different service names)
-info "Starting MariaDB server..."
-if service mariadb-server start >> "$LOG_FILE" 2>&1; then
-    success "Started via mariadb-server"
-elif service mariadb start >> "$LOG_FILE" 2>&1; then
-    success "Started via mariadb"
-elif service mysql-server start >> "$LOG_FILE" 2>&1; then
-    success "Started via mysql-server"
-elif service mysql start >> "$LOG_FILE" 2>&1; then
-    success "Started via mysql"
+    # Ensure ownership after init
+    chown -R mysql:mysql /var/db/mysql
+    
+    # Check if initialization succeeded
+    if [ "$INIT_SUCCESS" -eq 0 ]; then
+        error_exit "MariaDB initialization failed. Check $LOG_FILE for details (look for PCRE2 library errors)."
+    fi
+    success "MariaDB data directory initialized"
 else
-    # Try direct start as fallback
-    info "Trying direct database start..."
-    if [ -x /usr/local/libexec/mariadbd ]; then
-        /usr/local/libexec/mariadbd --user=mysql >> "$LOG_FILE" 2>&1 &
-    elif [ -x /usr/local/sbin/mariadbd ]; then
-        /usr/local/sbin/mariadbd --user=mysql >> "$LOG_FILE" 2>&1 &
-    elif [ -x /usr/local/libexec/mysqld ]; then
-        /usr/local/libexec/mysqld --user=mysql >> "$LOG_FILE" 2>&1 &
-    elif [ -x /usr/local/sbin/mysqld ]; then
-        /usr/local/sbin/mysqld --user=mysql >> "$LOG_FILE" 2>&1 &
-    fi
-    sleep 5
+    info "MariaDB data directory already exists, skipping initialization"
 fi
 
-# Wait for MariaDB to be ready
-info "Waiting for MariaDB to start..."
-for i in $(seq 1 30); do
-    if nc -z 127.0.0.1 3306 2>/dev/null; then
-        success "MariaDB is running"
-        break
-    fi
-    sleep 2
-done
+# Prepare and start MariaDB
+info "Preparing MariaDB..."
 
-# Check if MariaDB port is open
-if ! nc -z 127.0.0.1 3306 2>/dev/null; then
-    error_exit "MariaDB failed to start"
+# Stop any existing
+pkill -9 mariadbd 2>/dev/null || true
+sleep 1
+
+# Fix permissions
+chown -R mysql:mysql /var/db/mysql
+chmod -R 700 /var/db/mysql 2>/dev/null || true
+rm -rf /var/run/mysql
+mkdir -p /var/run/mysql
+chmod 777 /var/run/mysql
+
+info "Starting MariaDB..."
+START_SUCCESS=0
+
+# Use the proper service command since we know the binary works
+if service mysql-server start; then
+    sleep 3
+    if pgrep -x mariadbd > /dev/null 2>&1; then
+        success "MariaDB is running via service"
+        START_SUCCESS=1
+    fi
+fi
+
+# If service failed, try direct background start with disown
+if [ "$START_SUCCESS" -eq 0 ] && [ -x /usr/local/libexec/mariadbd ]; then
+    info "Service failed, trying direct start..."
+    # Start it properly detached from shell
+    ( /usr/local/libexec/mariadbd --user=mysql > /dev/null 2>&1 & )
+    sleep 5
+    
+    if pgrep -x mariadbd > /dev/null 2>&1; then
+        success "MariaDB is running (direct start)"
+        START_SUCCESS=1
+    else
+        echo "FAILED to start - checking error log..."
+        cat /var/db/mysql/error.log 2>/dev/null | tail -20 || echo "No error log"
+    fi
+fi
+
+# Wait for port 3306
+if [ "$START_SUCCESS" -eq 1 ]; then
+    info "Waiting for port 3306..."
+    MARIADB_READY=0
+    sleep 3
+    if sockstat -4 -l -p 3306 2>/dev/null | grep -q ":3306"; then
+        success "MariaDB ready on port 3306"
+        MARIADB_READY=1
+    else
+        echo "Port 3306 not listening"
+    fi
+else
+    MARIADB_READY=0
+fi
+
+# If failed, show error
+if [ "$MARIADB_READY" -eq 0 ]; then
+    echo ""
+    echo "========================================="
+    echo "ERROR: MariaDB failed to start"
+    echo "========================================="
+    echo ""
+    echo "=== ERROR LOG ==="
+    if [ -f /var/db/mysql/error.log ]; then
+        tail -30 /var/db/mysql/error.log
+    else
+        echo "No error.log file found"
+        echo "Files in /var/db/mysql/:"
+        ls /var/db/mysql/ 2>&1 | head -10
+    fi
+    echo "================="
+    echo ""
+    error_exit "MariaDB failed to start - see error log above"
 fi
 
 # Create database and user (use detected MySQL command)
@@ -650,7 +706,7 @@ chmod 755 /var/log/redis
 
 # Create log file with proper permissions
 touch /var/log/redis/redis.log
-chown redis:redis /var/log/redis/redis.log 2>/dev/null || chown root:root /var/log/redis/redis.log
+chown redis:redis /var/log/redis/redis.log 2>/dev/null || chown root:wheel /var/log/redis/redis.log
 chmod 644 /var/log/redis/redis.log
 
 # Enable Redis in rc.conf
@@ -676,7 +732,8 @@ sleep 2
 # Wait for KeyDB/Redis to be ready
 info "Waiting for object cache to start..."
 CACHE_READY=0
-for i in $(seq 1 30); do
+i=1
+while [ $i -le 30 ]; do
     if keydb-cli ping 2>/dev/null | grep -q "PONG"; then
         success "KeyDB running (${REDIS_MEM_MB}MB memory limit, multi-threaded)"
         CACHE_READY=1
@@ -687,6 +744,7 @@ for i in $(seq 1 30); do
         break
     fi
     sleep 1
+    i=$((i + 1))
 done
 
 if [ "$CACHE_READY" -eq 0 ]; then
@@ -865,7 +923,8 @@ fi
 # Wait for socket to be created
 info "Waiting for PHP-FPM socket..."
 PHP_FPM_READY=0
-for i in $(seq 1 30); do
+i=1
+while [ $i -le 30 ]; do
     if [ -S /var/run/php-fpm/php-fpm.sock ]; then
         success "PHP-FPM socket created"
         PHP_FPM_READY=1
@@ -881,6 +940,7 @@ for i in $(seq 1 30); do
         fi
     fi
     sleep 1
+    i=$((i + 1))
 done
 
 if [ "$PHP_FPM_READY" -eq 0 ]; then
