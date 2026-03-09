@@ -146,9 +146,9 @@ export ASSUME_ALWAYS_YES=yes
 pkg update -f >> "$LOG_FILE" 2>&1 || true
 
 # Install required packages for jail management
-pkg install -y \
-    ezjail \
-    nginx 2>/dev/null || pkg install -y ezjail || true
+pkg install -y ezjail >> "$LOG_FILE" 2>&1 || {
+    error_exit "Failed to install ezjail"
+}
 
 # Note: PF is part of FreeBSD base system, no package needed
 
@@ -682,6 +682,15 @@ if [ ! -f /usr/jails/${JAIL_WEB}/usr/local/etc/rc.d/php-fpm ] && [ -f /usr/jails
     ln -s php_fpm /usr/jails/${JAIL_WEB}/usr/local/etc/rc.d/php-fpm 2>/dev/null || true
 fi
 
+# Configure PHP upload limits
+cat > /usr/jails/${JAIL_WEB}/usr/local/etc/php/uploads.ini << EOF
+upload_max_filesize = 64M
+post_max_size = 64M
+memory_limit = 256M
+max_execution_time = 300
+max_input_time = 300
+EOF
+
 # Create web directory
 jexec ${JAIL_WEB} mkdir -p ${WEB_ROOT}
 jexec ${JAIL_WEB} chown -R www:www ${WEB_ROOT}
@@ -797,6 +806,11 @@ pm.start_servers = 2
 pm.min_spare_servers = 1
 pm.max_spare_servers = 5
 pm.max_requests = 500
+php_admin_value[memory_limit] = 256M
+php_admin_value[post_max_size] = 64M
+php_admin_value[upload_max_filesize] = 64M
+php_admin_value[max_execution_time] = 300
+php_admin_value[max_input_time] = 300
 EOF
 
 # Lighttpd configuration
