@@ -201,6 +201,10 @@ nat on $EXT_IF from 10.100.100.0/24 to any -> ($EXT_IF)
 rdr pass on $EXT_IF inet proto tcp to port 80 -> 10.100.100.10
 rdr pass on $EXT_IF inet proto tcp to port 443 -> 10.100.100.10
 
+# Allow host to access external IP via lo0 (for localhost connections)
+rdr pass on lo0 inet proto tcp from any to any port 80 -> 10.100.100.10
+rdr pass on lo0 inet proto tcp from any to any port 443 -> 10.100.100.10
+
 # Allow jail-to-jail communication
 pass quick on lo1 inet proto tcp from 10.100.100.10 to 10.100.100.20 port 3306
 pass quick on lo1 inet proto tcp from 10.100.100.10 to 10.100.100.30 port 6379
@@ -805,12 +809,13 @@ server.pid-file = "/var/run/lighttpd.pid"
 server.username = "www"
 server.groupname = "www"
 
-# Modules
+# Modules - mod_indexfile and mod_fastcgi must come before mod_rewrite
 server.modules = (
     "mod_access",
     "mod_alias",
     "mod_compress",
     "mod_redirect",
+    "mod_indexfile",
     "mod_fastcgi",
     "mod_rewrite"
 )
@@ -821,8 +826,21 @@ include "conf.d/mime.conf"
 # Access log
 accesslog.filename = "/var/log/lighttpd/access.log"
 
+# Directory index files
+index-file.names = ( "index.php", "index.html", "index.htm" )
+
 # Deny access to sensitive files
 url.access-deny = ( "~", ".inc", ".md", ".txt", ".yml", ".yaml" )
+
+# PHP-FPM - MUST be defined BEFORE rewrite rules
+fastcgi.server = (
+    ".php" => (
+        "localhost" => (
+            "socket" => "/tmp/php-fpm.sock",
+            "broken-scriptfilename" => "enable"
+        )
+    )
+)
 
 # WordPress/ClassicPress rewrite rules
 url.rewrite-if-not-file = (
@@ -831,16 +849,6 @@ url.rewrite-if-not-file = (
     "^/(robots.txt)" => "\$1",
     ".*\?(.*)" => "/index.php?\$1",
     "." => "/index.php"
-)
-
-# PHP-FPM
-fastcgi.server = (
-    ".php" => (
-        "localhost" => (
-            "socket" => "/tmp/php-fpm.sock",
-            "broken-scriptfilename" => "enable"
-        )
-    )
 )
 
 # Compression
@@ -936,7 +944,7 @@ JAIL MANAGEMENT:
 
 SERVICE MANAGEMENT:
 - Web jail: jexec ${JAIL_WEB} service lighttpd restart
-- Web jail: jexec ${JAIL_WEB} service php-fpm restart
+- Web jail: jexec ${JAIL_WEB} service php_fpm restart
 - DB jail: jexec ${JAIL_DB} service mysql-server restart
 - Cache jail: jexec ${JAIL_CACHE} service ${CACHE_SERVICE} restart
 
