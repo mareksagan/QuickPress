@@ -612,6 +612,9 @@ logfile /var/log/$CACHE_TYPE/$CACHE_TYPE.log
 
 # Security - only accept connections from web jail
 protected-mode yes
+
+# Fix high CPU usage in jail (limit to single thread)
+server-threads 1
 EOF
 
 # Create directories
